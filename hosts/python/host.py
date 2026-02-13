@@ -5,11 +5,11 @@ Uses wasmtime-py's component model API to load a composed calculator
 component and call its exported eval-expression function.
 
 Usage:
-    python3 host.py <path-to-composed-component.wasm>
+    uv run python3 host.py <path-to-composed-component.wasm>
 
 Example:
-    python3 host.py ../../build/composed-go.wasm
-    python3 host.py ../../build/composed-js.wasm
+    uv run python3 host.py ../../build/composed-go.wasm
+    uv run python3 host.py ../../build/composed-js.wasm
 """
 
 import sys
@@ -28,9 +28,8 @@ def run(wasm_path: str):
     # Load the composed component
     component = Component.from_file(engine, wasm_path)
 
-    # Set up linker - add WASI support for Go-built components
+    # Set up linker (no WASI needed - components are built without WASI imports)
     linker = Linker(engine)
-    linker.add_wasip2()
 
     # Instantiate the component (reactor mode: no _start, just exports)
     instance = linker.instantiate(store, component)
@@ -53,7 +52,7 @@ def run(wasm_path: str):
         sys.exit(1)
 
     # Call eval-expression with op="add", x=1, y=2
-    # The enum 'op' is passed as a string matching the WIT enum case name
+    # The WIT enum 'op' is passed as a string matching the enum case name
     result = eval_expr(store, "add", 1, 2)
     eval_expr.post_return(store)
     print(f"Result: {result}")
@@ -70,7 +69,7 @@ def run(wasm_path: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(f"Usage: python3 {sys.argv[0]} <path-to-composed-component.wasm>")
+        print(f"Usage: uv run python3 {sys.argv[0]} <path-to-composed-component.wasm>")
         sys.exit(1)
 
     wasm_path = sys.argv[1]

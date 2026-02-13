@@ -8,7 +8,6 @@ interface calculate {
 }
 
 world calculator {
-    include wasi:cli/imports@0.2.0;
     export calculate;
     import docs:adder/add@0.1.0;
 }
