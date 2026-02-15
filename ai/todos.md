@@ -2,3 +2,4 @@
 - dont use transpile
 - use wasi2p insted of wasi-unknown
 - reactor mode more
+- make js plugin ts
