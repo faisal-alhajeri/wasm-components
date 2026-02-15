@@ -3,16 +3,54 @@ package docs:calculator@0.1.0;
 interface calculate {
     enum op {
         add,
+        sub,
+        mul,
     }
-    // should return the string (the operation of <x> <op> <y> = <result>)
+
+    record calc-result {
+        value: u32,
+        op: string,
+        x: u32,
+        y: u32,
+    }
+
     eval-expression: func(op: op, x: u32, y: u32) -> string;
+    eval-expression-detailed: func(op: op, x: u32, y: u32) -> calc-result;
+
+    resource calc-session {
+        constructor();
+        push-op: func(op: op, value: u32);
+        get-current: func() -> u32;
+        get-history: func() -> list<calc-result>;
+        reset: func();
+    }
+
+    resource number-stream {
+        constructor();
+        start-fibonacci: func();
+        start-squares: func();
+        start-primes: func();
+        read: func(count: u32) -> list<u32>;
+        stop: func();
+    }
+
+    generate-fibonacci: func(max-count: u32);
+    generate-squares: func(max-count: u32);
+    generate-primes: func(max-count: u32);
+}
+
+interface stream-sink {
+    on-number: func(value: u32) -> bool;
+    on-done: func();
 }
 
 world calculator {
     export calculate;
     import docs:adder/add@0.1.0;
+    import stream-sink;
 }
 
 world app {
     import calculate;
+    export stream-sink;
 }

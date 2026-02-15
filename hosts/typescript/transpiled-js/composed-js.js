@@ -1,4 +1,5 @@
 "use jco";
+import { onDone, onNumber } from 'docs:calculator/stream-sink';
 
 const _debugLog = (...args) => {
   if (!globalThis?.process?.env?.JCO_DEBUG) { return; }
@@ -572,6 +573,8 @@ function _syncStartCall(callbackIdx) {
   throw new Error('synchronous start call not implemented!');
 }
 
+const emptyFunc = () => {};
+
 let dv = new DataView(new ArrayBuffer());
 const dataView = mem => dv.buffer === mem.buffer ? dv : dv = new DataView(mem.buffer);
 
@@ -579,6 +582,44 @@ function toUint32(val) {
   return val >>> 0;
 }
 const TEXT_DECODER_UTF8 = new TextDecoder();
+
+const T_FLAG = 1 << 30;
+
+function rscTableCreateOwn(table, rep) {
+  const free = table[0] & ~T_FLAG;
+  if (free === 0) {
+    table.push(0);
+    table.push(rep | T_FLAG);
+    return (table.length >> 1) - 1;
+  }
+  table[0] = table[free << 1];
+  table[free << 1] = 0;
+  table[(free << 1) + 1] = rep | T_FLAG;
+  return free;
+}
+
+function rscTableRemove(table, handle) {
+  const scope = table[handle << 1];
+  const val = table[(handle << 1) + 1];
+  const own = (val & T_FLAG) !== 0;
+  const rep = val & ~T_FLAG;
+  if (val === 0 || (scope & T_FLAG) !== 0) {
+    throw new TypeError("Invalid handle");
+  }
+  table[handle << 1] = table[0] | T_FLAG;
+  table[0] = handle | T_FLAG;
+  return { rep, scope, own };
+}
+
+function getCurrentTask(componentIdx) {
+  if (componentIdx === undefined || componentIdx === null) {
+    throw new Error('missing/invalid component instance index [' + componentIdx + '] while getting current task');
+  }
+  const tasks = ASYNC_TASKS_BY_COMPONENT_IDX.get(componentIdx);
+  if (tasks === undefined) { return undefined; }
+  if (tasks.length === 0) { return undefined; }
+  return tasks[tasks.length - 1];
+}
 
 function createNewCurrentTask(args) {
   _debugLog('[createNewCurrentTask()] args', args);
@@ -1169,6 +1210,127 @@ endCurrentSubtask() {
   return subtask;
 }
 }
+
+function _lowerImport(args, exportFn) {
+  const params = [...arguments].slice(2);
+  _debugLog('[_lowerImport()] args', { args, params, exportFn });
+  const {
+    functionIdx,
+    componentIdx,
+    isAsync,
+    paramLiftFns,
+    resultLowerFns,
+    metadata,
+    memoryIdx,
+    getMemoryFn,
+    getReallocFn,
+  } = args;
+  
+  const parentTaskMeta = getCurrentTask(componentIdx);
+  const parentTask = parentTaskMeta?.task;
+  if (!parentTask) { throw new Error('missing parent task during lower of import'); }
+  
+  const cstate = getOrCreateAsyncState(componentIdx);
+  
+  const subtask = parentTask.createSubtask({
+    componentIdx,
+    parentTask,
+    callMetadata: {
+      memoryIdx,
+      memory: getMemoryFn(),
+      realloc: getReallocFn(),
+      resultPtr: params[0],
+    }
+  });
+  parentTask.setReturnMemoryIdx(memoryIdx);
+  
+  const rep = cstate.subtasks.insert(subtask);
+  subtask.setRep(rep);
+  
+  subtask.setOnProgressFn(() => {
+    subtask.setPendingEventFn(() => {
+      if (subtask.resolved()) { subtask.deliverResolve(); }
+      return {
+        code: ASYNC_EVENT_CODE.SUBTASK,
+        index: rep,
+        result: subtask.getStateNumber(),
+      }
+    });
+  });
+  
+  // Set up a handler on subtask completion to lower results from the call into the caller's memory region.
+  subtask.registerOnResolveHandler((res) => {
+    _debugLog('[_lowerImport()] handling subtask result', { res, subtaskID: subtask.id() });
+    const { memory, resultPtr, realloc } = subtask.getCallMetadata();
+    if (resultLowerFns.length === 0) { return; }
+    resultLowerFns[0]({ componentIdx, memory, realloc, vals: [res], storagePtr: resultPtr });
+  });
+  
+  const subtaskState = subtask.getStateNumber();
+  if (subtaskState < 0 || subtaskState > 2**5) {
+    throw new Error('invalid subtask state, out of valid range');
+  }
+  
+  // NOTE: we must wait a bit before calling the export function,
+  // to ensure the subtask state is not modified before the lower call return
+  //
+  // TODO: we should trigger via subtask state changing, rather than a static wait?
+  setTimeout(async () => {
+    try {
+      _debugLog('[_lowerImport()] calling lowered import', { exportFn, params });
+      exportFn.apply(null, params);
+      
+      const task = subtask.getChildTask();
+      task.registerOnResolveHandler((res) => {
+        _debugLog('[_lowerImport()] cascading subtask completion', {
+          childTaskID: task.id(),
+          subtaskID: subtask.id(),
+          parentTaskID: parentTask.id(),
+        });
+        
+        subtask.onResolve(res);
+        
+        cstate.tick();
+      });
+    } catch (err) {
+      console.error("post-lower import fn error:", err);
+      throw err;
+    }
+  }, 100);
+  
+  return Number(subtask.waitableRep()) << 4 | subtaskState;
+}
+
+function _liftFlatU32(ctx) {
+  _debugLog('[_liftFlatU32()] args', { ctx });
+  let val;
+  
+  if (ctx.useDirectParams) {
+    if (ctx.params.length === 0) { throw new Error('expected at least a single i34 argument'); }
+    val = ctx.params[0];
+    ctx.params = ctx.params.slice(1);
+    return [val, ctx];
+  }
+  
+  if (ctx.storageLen !== undefined && ctx.storageLen < ctx.storagePtr + 4) {
+    throw new Error('not enough storage remaining for lift');
+  }
+  val = new DataView(ctx.memory.buffer).getUint32(ctx.storagePtr, true);
+  ctx.storagePtr += 4;
+  if (ctx.storageLen !== undefined) { ctx.storageLen -= 4; }
+  
+  return [val, ctx];
+}
+
+function _lowerFlatBool(memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatBool()] args', { memory, vals, storagePtr, storageLen });
+  if (vals.length !== 1) {
+    throw new Error('unexpected number (' + vals.length + ') of core vals (expected 1)');
+  }
+  if (vals[0] !== 0 && vals[0] !== 1) { throw new Error('invalid value for core value representing bool'); }
+  new DataView(memory.buffer).setUint32(storagePtr, vals[0], true);
+  return 1;
+}
 const ASYNC_STATE = new Map();
 
 function getOrCreateAsyncState(componentIdx, init) {
@@ -1540,14 +1702,751 @@ async function fetchCompile (url) {
   return fetch(url).then(WebAssembly.compileStreaming);
 }
 
+const symbolRscHandle = Symbol('handle');
+
+const symbolDispose = Symbol.dispose || Symbol.for('dispose');
+
+const handleTables = [];
+
+function finalizationRegistryCreate (unregister) {
+  if (typeof FinalizationRegistry === 'undefined') {
+    return { unregister () {} };
+  }
+  return new FinalizationRegistry(unregister);
+}
+
 const instantiateCore = WebAssembly.instantiate;
 
 
 let exports0;
 let exports1;
+
+let lowered_import_0_metadata = {
+  qualifiedImportFn: 'docs:calculator/stream-sink@0.1.0#on-number',
+  moduleIdx: null,
+};
+
+
+function trampoline0(arg0) {
+  _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-number"] [Instruction::CallInterface] (sync, @ enter)');
+  let hostProvided = false;
+  hostProvided = onNumber?._isHostProvided;
+  
+  let parentTask;
+  let task;
+  let subtask;
+  
+  const createTask = () => {
+    const results = createNewCurrentTask({
+      componentIdx: 3,
+      isAsync: false,
+      entryFnName: 'onNumber',
+      getCallbackFn: () => null,
+      callbackFnName: 'null',
+      errHandling: 'none',
+      callingWasmExport: false,
+    });
+    task = results[0];
+  };
+  
+  taskCreation: {
+    parentTask = getCurrentTask(3)?.task;
+    if (!parentTask) {
+      createTask();
+      break taskCreation;
+    }
+    
+    createTask();
+    
+    const isHostAsyncImport = hostProvided && false;
+    if (isHostAsyncImport) {
+      subtask = parentTask.getLatestSubtask();
+      if (!subtask) {
+        throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+      }
+      subtask.setChildTask(task);
+      task.setParentSubtask(subtask);
+    }
+  }
+  
+  let ret =  onNumber(arg0 >>> 0);
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-number"][Instruction::Return]', {
+    funcName: 'on-number',
+    paramCount: 1,
+    async: false,
+    postReturn: false
+  });
+  return ret ? 1 : 0;
+}
+
+
+let lowered_import_1_metadata = {
+  qualifiedImportFn: 'docs:calculator/stream-sink@0.1.0#on-done',
+  moduleIdx: null,
+};
+
+
+function trampoline1() {
+  _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-done"] [Instruction::CallInterface] (sync, @ enter)');
+  let hostProvided = false;
+  hostProvided = onDone?._isHostProvided;
+  
+  let parentTask;
+  let task;
+  let subtask;
+  
+  const createTask = () => {
+    const results = createNewCurrentTask({
+      componentIdx: 3,
+      isAsync: false,
+      entryFnName: 'onDone',
+      getCallbackFn: () => null,
+      callbackFnName: 'null',
+      errHandling: 'none',
+      callingWasmExport: false,
+    });
+    task = results[0];
+  };
+  
+  taskCreation: {
+    parentTask = getCurrentTask(3)?.task;
+    if (!parentTask) {
+      createTask();
+      break taskCreation;
+    }
+    
+    createTask();
+    
+    const isHostAsyncImport = hostProvided && false;
+    if (isHostAsyncImport) {
+      subtask = parentTask.getLatestSubtask();
+      if (!subtask) {
+        throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+      }
+      subtask.setChildTask(task);
+      task.setParentSubtask(subtask);
+    }
+  }
+  
+  let ret; onDone();
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-done"][Instruction::Return]', {
+    funcName: 'on-done',
+    paramCount: 0,
+    async: false,
+    postReturn: false
+  });
+}
+
 let exports2;
-let memory0;
 let postReturn0;
+let postReturn1;
+let postReturn2;
+let memory0;
+let postReturn3;
+let postReturn4;
+let postReturn5;
+let postReturn6;
+let postReturn7;
+let postReturn8;
+let postReturn9;
+let postReturn10;
+let postReturn11;
+let postReturn12;
+let postReturn13;
+let postReturn14;
+let postReturn15;
+
+GlobalComponentAsyncLowers.define({
+  componentIdx: lowered_import_0_metadata.moduleIdx,
+  qualifiedImportFn: lowered_import_0_metadata.qualifiedImportFn,
+  fn: _lowerImport.bind(
+  null,
+  {
+    trampolineIdx: 0,
+    componentIdx: 3,
+    isAsync: false,
+    paramLiftFns: [_liftFlatU32],
+    metadata: lowered_import_0_metadata,
+    resultLowerFns: [_lowerFlatBool],
+    getCallbackFn: () => null,
+    getPostReturnFn: () => null,
+    isCancellable: false,
+    memoryIdx: null,
+    getMemoryFn: () => null,
+    getReallocFn: () => null,
+  },
+  ),
+});
+
+
+GlobalComponentAsyncLowers.define({
+  componentIdx: lowered_import_1_metadata.moduleIdx,
+  qualifiedImportFn: lowered_import_1_metadata.qualifiedImportFn,
+  fn: _lowerImport.bind(
+  null,
+  {
+    trampolineIdx: 1,
+    componentIdx: 3,
+    isAsync: false,
+    paramLiftFns: [],
+    metadata: lowered_import_1_metadata,
+    resultLowerFns: [],
+    getCallbackFn: () => null,
+    getPostReturnFn: () => null,
+    isCancellable: false,
+    memoryIdx: null,
+    getMemoryFn: () => null,
+    getReallocFn: () => null,
+  },
+  ),
+});
+
+const handleTable0 = [T_FLAG, 0];
+const finalizationRegistry0 = finalizationRegistryCreate((handle) => {
+  const { rep } = rscTableRemove(handleTable0, handle);
+});
+
+handleTables[0] = handleTable0;
+const trampoline2 = rscTableCreateOwn.bind(null, handleTable0);
+function trampoline3(handle) {
+  return handleTable0[(handle << 1) + 1] & ~T_FLAG;
+}
+function trampoline4(handle) {
+  const handleEntry = rscTableRemove(handleTable0, handle);
+  if (handleEntry.own) {
+    
+  }
+}
+const handleTable1 = [T_FLAG, 0];
+const finalizationRegistry1 = finalizationRegistryCreate((handle) => {
+  const { rep } = rscTableRemove(handleTable1, handle);
+});
+
+handleTables[1] = handleTable1;
+const trampoline5 = rscTableCreateOwn.bind(null, handleTable1);
+function trampoline6(handle) {
+  return handleTable1[(handle << 1) + 1] & ~T_FLAG;
+}
+function trampoline7(handle) {
+  const handleEntry = rscTableRemove(handleTable1, handle);
+  if (handleEntry.own) {
+    
+  }
+}
+let calculate010ConstructorCalcSession;
+
+class CalcSession{
+  constructor() {
+    _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[constructor]calc-session"][Instruction::CallWasm] enter', {
+      funcName: '[constructor]calc-session',
+      paramCount: 0,
+      async: false,
+      postReturn: true,
+    });
+    const hostProvided = false;
+    
+    const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+      componentIdx: 3,
+      isAsync: false,
+      entryFnName: 'calculate010ConstructorCalcSession',
+      getCallbackFn: () => null,
+      callbackFnName: 'null',
+      errHandling: 'none',
+      callingWasmExport: true,
+    });
+    
+    let ret = calculate010ConstructorCalcSession();
+    endCurrentTask(3);
+    var handle1 = ret;
+    var rsc0 = new.target === CalcSession ? this : Object.create(CalcSession.prototype);
+    Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+    finalizationRegistry0.register(rsc0, handle1, rsc0);
+    Object.defineProperty(rsc0, symbolDispose, { writable: true, value: emptyFunc });
+    _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[constructor]calc-session"][Instruction::Return]', {
+      funcName: '[constructor]calc-session',
+      paramCount: 1,
+      async: false,
+      postReturn: true
+    });
+    const retCopy = rsc0;
+    
+    let cstate = getOrCreateAsyncState(3);
+    cstate.mayLeave = false;
+    postReturn0(ret);
+    cstate.mayLeave = true;
+    return retCopy;
+    
+  }
+}
+let calculate010MethodCalcSessionPushOp;
+
+CalcSession.prototype.pushOp = function pushOp(arg1, arg2) {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
+  }
+  var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+  var val2 = arg1;
+  let enum2;
+  switch (val2) {
+    case 'add': {
+      enum2 = 0;
+      break;
+    }
+    case 'sub': {
+      enum2 = 1;
+      break;
+    }
+    case 'mul': {
+      enum2 = 2;
+      break;
+    }
+    default: {
+      if ((arg1) instanceof Error) {
+        console.error(arg1);
+      }
+      
+      throw new TypeError(`"${val2}" is not one of the cases of op`);
+    }
+  }
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.push-op"][Instruction::CallWasm] enter', {
+    funcName: '[method]calc-session.push-op',
+    paramCount: 3,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodCalcSessionPushOp',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010MethodCalcSessionPushOp(handle0, enum2, toUint32(arg2));
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.push-op"][Instruction::Return]', {
+    funcName: '[method]calc-session.push-op',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn1();
+  cstate.mayLeave = true;
+  
+  
+};
+let calculate010MethodCalcSessionGetCurrent;
+
+CalcSession.prototype.getCurrent = function getCurrent() {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
+  }
+  var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.get-current"][Instruction::CallWasm] enter', {
+    funcName: '[method]calc-session.get-current',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodCalcSessionGetCurrent',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret = calculate010MethodCalcSessionGetCurrent(handle0);
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.get-current"][Instruction::Return]', {
+    funcName: '[method]calc-session.get-current',
+    paramCount: 1,
+    async: false,
+    postReturn: true
+  });
+  const retCopy = ret >>> 0;
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn2(ret);
+  cstate.mayLeave = true;
+  return retCopy;
+  
+};
+let calculate010MethodCalcSessionGetHistory;
+
+CalcSession.prototype.getHistory = function getHistory() {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
+  }
+  var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.get-history"][Instruction::CallWasm] enter', {
+    funcName: '[method]calc-session.get-history',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodCalcSessionGetHistory',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret = calculate010MethodCalcSessionGetHistory(handle0);
+  endCurrentTask(3);
+  var len3 = dataView(memory0).getUint32(ret + 4, true);
+  var base3 = dataView(memory0).getUint32(ret + 0, true);
+  var result3 = [];
+  for (let i = 0; i < len3; i++) {
+    const base = base3 + i * 20;
+    var ptr2 = dataView(memory0).getUint32(base + 4, true);
+    var len2 = dataView(memory0).getUint32(base + 8, true);
+    var result2 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr2, len2));
+    result3.push({
+      value: dataView(memory0).getInt32(base + 0, true) >>> 0,
+      op: result2,
+      x: dataView(memory0).getInt32(base + 12, true) >>> 0,
+      y: dataView(memory0).getInt32(base + 16, true) >>> 0,
+    });
+  }
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.get-history"][Instruction::Return]', {
+    funcName: '[method]calc-session.get-history',
+    paramCount: 1,
+    async: false,
+    postReturn: true
+  });
+  const retCopy = result3;
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn3(ret);
+  cstate.mayLeave = true;
+  return retCopy;
+  
+};
+let calculate010MethodCalcSessionReset;
+
+CalcSession.prototype.reset = function reset() {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
+  }
+  var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.reset"][Instruction::CallWasm] enter', {
+    funcName: '[method]calc-session.reset',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodCalcSessionReset',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010MethodCalcSessionReset(handle0);
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.reset"][Instruction::Return]', {
+    funcName: '[method]calc-session.reset',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn4();
+  cstate.mayLeave = true;
+  
+  
+};
+let calculate010ConstructorNumberStream;
+
+class NumberStream{
+  constructor() {
+    _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[constructor]number-stream"][Instruction::CallWasm] enter', {
+      funcName: '[constructor]number-stream',
+      paramCount: 0,
+      async: false,
+      postReturn: true,
+    });
+    const hostProvided = false;
+    
+    const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+      componentIdx: 3,
+      isAsync: false,
+      entryFnName: 'calculate010ConstructorNumberStream',
+      getCallbackFn: () => null,
+      callbackFnName: 'null',
+      errHandling: 'none',
+      callingWasmExport: true,
+    });
+    
+    let ret = calculate010ConstructorNumberStream();
+    endCurrentTask(3);
+    var handle1 = ret;
+    var rsc0 = new.target === NumberStream ? this : Object.create(NumberStream.prototype);
+    Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+    finalizationRegistry1.register(rsc0, handle1, rsc0);
+    Object.defineProperty(rsc0, symbolDispose, { writable: true, value: emptyFunc });
+    _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[constructor]number-stream"][Instruction::Return]', {
+      funcName: '[constructor]number-stream',
+      paramCount: 1,
+      async: false,
+      postReturn: true
+    });
+    const retCopy = rsc0;
+    
+    let cstate = getOrCreateAsyncState(3);
+    cstate.mayLeave = false;
+    postReturn5(ret);
+    cstate.mayLeave = true;
+    return retCopy;
+    
+  }
+}
+let calculate010MethodNumberStreamStartFibonacci;
+
+NumberStream.prototype.startFibonacci = function startFibonacci() {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
+  }
+  var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-fibonacci"][Instruction::CallWasm] enter', {
+    funcName: '[method]number-stream.start-fibonacci',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodNumberStreamStartFibonacci',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010MethodNumberStreamStartFibonacci(handle0);
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-fibonacci"][Instruction::Return]', {
+    funcName: '[method]number-stream.start-fibonacci',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn6();
+  cstate.mayLeave = true;
+  
+  
+};
+let calculate010MethodNumberStreamStartSquares;
+
+NumberStream.prototype.startSquares = function startSquares() {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
+  }
+  var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-squares"][Instruction::CallWasm] enter', {
+    funcName: '[method]number-stream.start-squares',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodNumberStreamStartSquares',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010MethodNumberStreamStartSquares(handle0);
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-squares"][Instruction::Return]', {
+    funcName: '[method]number-stream.start-squares',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn7();
+  cstate.mayLeave = true;
+  
+  
+};
+let calculate010MethodNumberStreamStartPrimes;
+
+NumberStream.prototype.startPrimes = function startPrimes() {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
+  }
+  var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-primes"][Instruction::CallWasm] enter', {
+    funcName: '[method]number-stream.start-primes',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodNumberStreamStartPrimes',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010MethodNumberStreamStartPrimes(handle0);
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-primes"][Instruction::Return]', {
+    funcName: '[method]number-stream.start-primes',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn8();
+  cstate.mayLeave = true;
+  
+  
+};
+let calculate010MethodNumberStreamRead;
+
+NumberStream.prototype.read = function read(arg1) {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
+  }
+  var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.read"][Instruction::CallWasm] enter', {
+    funcName: '[method]number-stream.read',
+    paramCount: 2,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodNumberStreamRead',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret = calculate010MethodNumberStreamRead(handle0, toUint32(arg1));
+  endCurrentTask(3);
+  var ptr2 = dataView(memory0).getUint32(ret + 0, true);
+  var len2 = dataView(memory0).getUint32(ret + 4, true);
+  var result2 = new Uint32Array(memory0.buffer.slice(ptr2, ptr2 + len2 * 4));
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.read"][Instruction::Return]', {
+    funcName: '[method]number-stream.read',
+    paramCount: 1,
+    async: false,
+    postReturn: true
+  });
+  const retCopy = result2;
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn9(ret);
+  cstate.mayLeave = true;
+  return retCopy;
+  
+};
+let calculate010MethodNumberStreamStop;
+
+NumberStream.prototype.stop = function stop() {
+  var handle1 = this[symbolRscHandle];
+  if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
+  }
+  var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.stop"][Instruction::CallWasm] enter', {
+    funcName: '[method]number-stream.stop',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010MethodNumberStreamStop',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010MethodNumberStreamStop(handle0);
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.stop"][Instruction::Return]', {
+    funcName: '[method]number-stream.stop',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn10();
+  cstate.mayLeave = true;
+  
+  
+};
 let calculate010EvalExpression;
 
 function evalExpression(arg0, arg1, arg2) {
@@ -1556,6 +2455,14 @@ function evalExpression(arg0, arg1, arg2) {
   switch (val0) {
     case 'add': {
       enum0 = 0;
+      break;
+    }
+    case 'sub': {
+      enum0 = 1;
+      break;
+    }
+    case 'mul': {
+      enum0 = 2;
       break;
     }
     default: {
@@ -1599,9 +2506,189 @@ function evalExpression(arg0, arg1, arg2) {
   
   let cstate = getOrCreateAsyncState(3);
   cstate.mayLeave = false;
-  postReturn0(ret);
+  postReturn11(ret);
   cstate.mayLeave = true;
   return retCopy;
+  
+}
+let calculate010EvalExpressionDetailed;
+
+function evalExpressionDetailed(arg0, arg1, arg2) {
+  var val0 = arg0;
+  let enum0;
+  switch (val0) {
+    case 'add': {
+      enum0 = 0;
+      break;
+    }
+    case 'sub': {
+      enum0 = 1;
+      break;
+    }
+    case 'mul': {
+      enum0 = 2;
+      break;
+    }
+    default: {
+      if ((arg0) instanceof Error) {
+        console.error(arg0);
+      }
+      
+      throw new TypeError(`"${val0}" is not one of the cases of op`);
+    }
+  }
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="eval-expression-detailed"][Instruction::CallWasm] enter', {
+    funcName: 'eval-expression-detailed',
+    paramCount: 3,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010EvalExpressionDetailed',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret = calculate010EvalExpressionDetailed(enum0, toUint32(arg1), toUint32(arg2));
+  endCurrentTask(3);
+  var ptr1 = dataView(memory0).getUint32(ret + 4, true);
+  var len1 = dataView(memory0).getUint32(ret + 8, true);
+  var result1 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr1, len1));
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="eval-expression-detailed"][Instruction::Return]', {
+    funcName: 'eval-expression-detailed',
+    paramCount: 1,
+    async: false,
+    postReturn: true
+  });
+  const retCopy = {
+    value: dataView(memory0).getInt32(ret + 0, true) >>> 0,
+    op: result1,
+    x: dataView(memory0).getInt32(ret + 12, true) >>> 0,
+    y: dataView(memory0).getInt32(ret + 16, true) >>> 0,
+  };
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn12(ret);
+  cstate.mayLeave = true;
+  return retCopy;
+  
+}
+let calculate010GenerateFibonacci;
+
+function generateFibonacci(arg0) {
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="generate-fibonacci"][Instruction::CallWasm] enter', {
+    funcName: 'generate-fibonacci',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010GenerateFibonacci',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010GenerateFibonacci(toUint32(arg0));
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="generate-fibonacci"][Instruction::Return]', {
+    funcName: 'generate-fibonacci',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn13();
+  cstate.mayLeave = true;
+  
+  
+}
+let calculate010GenerateSquares;
+
+function generateSquares(arg0) {
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="generate-squares"][Instruction::CallWasm] enter', {
+    funcName: 'generate-squares',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010GenerateSquares',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010GenerateSquares(toUint32(arg0));
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="generate-squares"][Instruction::Return]', {
+    funcName: 'generate-squares',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn14();
+  cstate.mayLeave = true;
+  
+  
+}
+let calculate010GeneratePrimes;
+
+function generatePrimes(arg0) {
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="generate-primes"][Instruction::CallWasm] enter', {
+    funcName: 'generate-primes',
+    paramCount: 1,
+    async: false,
+    postReturn: true,
+  });
+  const hostProvided = false;
+  
+  const [task, _wasm_call_currentTaskID] = createNewCurrentTask({
+    componentIdx: 3,
+    isAsync: false,
+    entryFnName: 'calculate010GeneratePrimes',
+    getCallbackFn: () => null,
+    callbackFnName: 'null',
+    errHandling: 'none',
+    callingWasmExport: true,
+  });
+  
+  let ret;calculate010GeneratePrimes(toUint32(arg0));
+  endCurrentTask(3);
+  _debugLog('[iface="docs:calculator/calculate@0.1.0", function="generate-primes"][Instruction::Return]', {
+    funcName: 'generate-primes',
+    paramCount: 0,
+    async: false,
+    postReturn: true
+  });
+  
+  let cstate = getOrCreateAsyncState(3);
+  cstate.mayLeave = false;
+  postReturn15();
+  cstate.mayLeave = true;
+  
   
 }
 
@@ -1609,13 +2696,15 @@ const $init = (() => {
   let gen = (function* _initGenerator () {
     const module0 = fetchCompile(new URL('./composed-js.core.wasm', import.meta.url));
     const module1 = fetchCompile(new URL('./composed-js.core2.wasm', import.meta.url));
-    const module2 = base64Compile('AGFzbQEAAAABCwJgAn9/AX9gAX8AAlAEBWZsYWdzCWluc3RhbmNlMQN/AQVmbGFncwlpbnN0YW5jZTMDfwEGY2FsbGVlCGFkYXB0ZXIwAAALcG9zdF9yZXR1cm4IYWRhcHRlcjAAAQMCAQAHDAEIYWRhcHRlcjAAAgpSAVABAX8jAUEBcUUEQAALIwBBAnFFBEAACyMAQX1xJAAjAEF+cSQAIAAgASMAQQFyJAAQACECIwFBfnEkASACIwFBAXIkASACEAEjAEECciQACw');
+    const module2 = base64Compile('AGFzbQEAAAABCwJgAn9/AX9gAX8AAqIBCAVmbGFncwlpbnN0YW5jZTEDfwEFZmxhZ3MJaW5zdGFuY2UzA38BBmNhbGxlZQhhZGFwdGVyMAAAC3Bvc3RfcmV0dXJuCGFkYXB0ZXIwAAEGY2FsbGVlCGFkYXB0ZXIxAAALcG9zdF9yZXR1cm4IYWRhcHRlcjEAAQZjYWxsZWUIYWRhcHRlcjIAAAtwb3N0X3JldHVybghhZGFwdGVyMgABAwQDAAAAByIDCGFkYXB0ZXIwAAYIYWRhcHRlcjEABwhhZGFwdGVyMgAICvQBA1ABAX8jAUEBcUUEQAALIwBBAnFFBEAACyMAQX1xJAAjAEF+cSQAIAAgASMAQQFyJAAQACECIwFBfnEkASACIwFBAXIkASACEAEjAEECciQAC1ABAX8jAUEBcUUEQAALIwBBAnFFBEAACyMAQX1xJAAjAEF+cSQAIAAgASMAQQFyJAAQAiECIwFBfnEkASACIwFBAXIkASACEAMjAEECciQAC1ABAX8jAUEBcUUEQAALIwBBAnFFBEAACyMAQX1xJAAjAEF+cSQAIAAgASMAQQFyJAAQBCECIwFBfnEkASACIwFBAXIkASACEAUjAEECciQACw');
     const instanceFlags1 = new WebAssembly.Global({ value: "i32", mutable: true }, 3);
     const instanceFlags3 = new WebAssembly.Global({ value: "i32", mutable: true }, 3);
     ({ exports: exports0 } = yield instantiateCore(yield module1));
     ({ exports: exports1 } = yield instantiateCore(yield module2, {
       callee: {
         adapter0: exports0['docs:adder/add@0.1.0#add'],
+        adapter1: exports0['docs:adder/add@0.1.0#sub'],
+        adapter2: exports0['docs:adder/add@0.1.0#mul'],
       },
       flags: {
         instance1: instanceFlags1,
@@ -1623,17 +2712,63 @@ const $init = (() => {
       },
       post_return: {
         adapter0: exports0['cabi_post_docs:adder/add@0.1.0#add'],
+        adapter1: exports0['cabi_post_docs:adder/add@0.1.0#sub'],
+        adapter2: exports0['cabi_post_docs:adder/add@0.1.0#mul'],
       },
     }));
     ({ exports: exports2 } = yield instantiateCore(yield module0, {
+      '[export]docs:calculator/calculate@0.1.0': {
+        '[resource-drop]calc-session': trampoline4,
+        '[resource-drop]number-stream': trampoline7,
+        '[resource-new]calc-session': trampoline2,
+        '[resource-new]number-stream': trampoline5,
+        '[resource-rep]calc-session': trampoline3,
+        '[resource-rep]number-stream': trampoline6,
+      },
       'docs:adder/add@0.1.0': {
         add: exports1.adapter0,
+        mul: exports1.adapter2,
+        sub: exports1.adapter1,
+      },
+      'docs:calculator/stream-sink@0.1.0': {
+        'on-done': trampoline1,
+        'on-number': trampoline0,
       },
     }));
+    postReturn0 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[constructor]calc-session'];
+    postReturn1 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.push-op'];
+    postReturn2 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.get-current'];
     memory0 = exports2.memory;
     GlobalComponentMemories.save({ idx: 0, componentIdx: 2, memory: memory0 });
-    postReturn0 = exports2['cabi_post_docs:calculator/calculate@0.1.0#eval-expression'];
+    postReturn3 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.get-history'];
+    postReturn4 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.reset'];
+    postReturn5 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[constructor]number-stream'];
+    postReturn6 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci'];
+    postReturn7 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-squares'];
+    postReturn8 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-primes'];
+    postReturn9 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.read'];
+    postReturn10 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.stop'];
+    postReturn11 = exports2['cabi_post_docs:calculator/calculate@0.1.0#eval-expression'];
+    postReturn12 = exports2['cabi_post_docs:calculator/calculate@0.1.0#eval-expression-detailed'];
+    postReturn13 = exports2['cabi_post_docs:calculator/calculate@0.1.0#generate-fibonacci'];
+    postReturn14 = exports2['cabi_post_docs:calculator/calculate@0.1.0#generate-squares'];
+    postReturn15 = exports2['cabi_post_docs:calculator/calculate@0.1.0#generate-primes'];
+    calculate010ConstructorCalcSession = exports2['docs:calculator/calculate@0.1.0#[constructor]calc-session'];
+    calculate010MethodCalcSessionPushOp = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.push-op'];
+    calculate010MethodCalcSessionGetCurrent = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.get-current'];
+    calculate010MethodCalcSessionGetHistory = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.get-history'];
+    calculate010MethodCalcSessionReset = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.reset'];
+    calculate010ConstructorNumberStream = exports2['docs:calculator/calculate@0.1.0#[constructor]number-stream'];
+    calculate010MethodNumberStreamStartFibonacci = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci'];
+    calculate010MethodNumberStreamStartSquares = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.start-squares'];
+    calculate010MethodNumberStreamStartPrimes = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.start-primes'];
+    calculate010MethodNumberStreamRead = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.read'];
+    calculate010MethodNumberStreamStop = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.stop'];
     calculate010EvalExpression = exports2['docs:calculator/calculate@0.1.0#eval-expression'];
+    calculate010EvalExpressionDetailed = exports2['docs:calculator/calculate@0.1.0#eval-expression-detailed'];
+    calculate010GenerateFibonacci = exports2['docs:calculator/calculate@0.1.0#generate-fibonacci'];
+    calculate010GenerateSquares = exports2['docs:calculator/calculate@0.1.0#generate-squares'];
+    calculate010GeneratePrimes = exports2['docs:calculator/calculate@0.1.0#generate-primes'];
   })();
   let promise, resolve, reject;
   function runNext (value) {
@@ -1660,7 +2795,13 @@ const $init = (() => {
 
 await $init;
 const calculate010 = {
+  CalcSession: CalcSession,
+  NumberStream: NumberStream,
   evalExpression: evalExpression,
+  evalExpressionDetailed: evalExpressionDetailed,
+  generateFibonacci: generateFibonacci,
+  generatePrimes: generatePrimes,
+  generateSquares: generateSquares,
   
 };
 

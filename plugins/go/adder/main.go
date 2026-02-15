@@ -10,6 +10,12 @@ func init() {
 	add.Exports.Add = func(x uint32, y uint32) uint32 {
 		return x + y
 	}
+	add.Exports.Sub = func(x uint32, y uint32) uint32 {
+		return x - y
+	}
+	add.Exports.Mul = func(x uint32, y uint32) uint32 {
+		return x * y
+	}
 }
 
 func main() {}

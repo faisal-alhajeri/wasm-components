@@ -15,3 +15,29 @@ func Add(x uint32, y uint32) (result uint32) {
 	result = (uint32)((uint32)(result0))
 	return
 }
+
+// Sub represents the imported function "sub".
+//
+//	sub: func(x: u32, y: u32) -> u32
+//
+//go:nosplit
+func Sub(x uint32, y uint32) (result uint32) {
+	x0 := (uint32)(x)
+	y0 := (uint32)(y)
+	result0 := wasmimport_Sub((uint32)(x0), (uint32)(y0))
+	result = (uint32)((uint32)(result0))
+	return
+}
+
+// Mul represents the imported function "mul".
+//
+//	mul: func(x: u32, y: u32) -> u32
+//
+//go:nosplit
+func Mul(x uint32, y uint32) (result uint32) {
+	x0 := (uint32)(x)
+	y0 := (uint32)(y)
+	result0 := wasmimport_Mul((uint32)(x0), (uint32)(y0))
+	result = (uint32)((uint32)(result0))
+	return
+}

@@ -2,7 +2,145 @@
 
 package calculate
 
+import (
+	"go.bytecodealliance.org/cm"
+)
+
 // This file contains wasmimport and wasmexport declarations for "docs:calculator@0.1.0".
+
+//go:wasmimport [export]docs:calculator/calculate@0.1.0 [resource-new]calc-session
+//go:noescape
+func wasmimport_CalcSessionResourceNew(rep0 uint32) (result0 uint32)
+
+//go:wasmimport [export]docs:calculator/calculate@0.1.0 [resource-rep]calc-session
+//go:noescape
+func wasmimport_CalcSessionResourceRep(self0 uint32) (result0 uint32)
+
+//go:wasmimport [export]docs:calculator/calculate@0.1.0 [resource-drop]calc-session
+//go:noescape
+func wasmimport_CalcSessionResourceDrop(self0 uint32)
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[dtor]calc-session
+//export docs:calculator/calculate@0.1.0#[dtor]calc-session
+func wasmexport_CalcSessionDestructor(self0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	Exports.CalcSession.Destructor(self)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[constructor]calc-session
+//export docs:calculator/calculate@0.1.0#[constructor]calc-session
+func wasmexport_Constructor() (result0 uint32) {
+	result := Exports.CalcSession.Constructor()
+	result0 = cm.Reinterpret[uint32](result)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]calc-session.get-current
+//export docs:calculator/calculate@0.1.0#[method]calc-session.get-current
+func wasmexport_CalcSessionGetCurrent(self0 uint32) (result0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	result := Exports.CalcSession.GetCurrent(self)
+	result0 = (uint32)(result)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]calc-session.get-history
+//export docs:calculator/calculate@0.1.0#[method]calc-session.get-history
+func wasmexport_CalcSessionGetHistory(self0 uint32) (result *cm.List[CalcResult]) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	result_ := Exports.CalcSession.GetHistory(self)
+	result = &result_
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]calc-session.push-op
+//export docs:calculator/calculate@0.1.0#[method]calc-session.push-op
+func wasmexport_CalcSessionPushOp(self0 uint32, op0 uint32, value0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	op := (Op)((uint32)(op0))
+	value := (uint32)((uint32)(value0))
+	Exports.CalcSession.PushOp(self, op, value)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]calc-session.reset
+//export docs:calculator/calculate@0.1.0#[method]calc-session.reset
+func wasmexport_CalcSessionReset(self0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	Exports.CalcSession.Reset(self)
+	return
+}
+
+//go:wasmimport [export]docs:calculator/calculate@0.1.0 [resource-new]number-stream
+//go:noescape
+func wasmimport_NumberStreamResourceNew(rep0 uint32) (result0 uint32)
+
+//go:wasmimport [export]docs:calculator/calculate@0.1.0 [resource-rep]number-stream
+//go:noescape
+func wasmimport_NumberStreamResourceRep(self0 uint32) (result0 uint32)
+
+//go:wasmimport [export]docs:calculator/calculate@0.1.0 [resource-drop]number-stream
+//go:noescape
+func wasmimport_NumberStreamResourceDrop(self0 uint32)
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[dtor]number-stream
+//export docs:calculator/calculate@0.1.0#[dtor]number-stream
+func wasmexport_NumberStreamDestructor(self0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	Exports.NumberStream.Destructor(self)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[constructor]number-stream
+//export docs:calculator/calculate@0.1.0#[constructor]number-stream
+func wasmexport_Constructor_() (result0 uint32) {
+	result := Exports.NumberStream.ExportConstructor()
+	result0 = cm.Reinterpret[uint32](result)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]number-stream.read
+//export docs:calculator/calculate@0.1.0#[method]number-stream.read
+func wasmexport_NumberStreamRead(self0 uint32, count0 uint32) (result *cm.List[uint32]) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	count := (uint32)((uint32)(count0))
+	result_ := Exports.NumberStream.Read(self, count)
+	result = &result_
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci
+//export docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci
+func wasmexport_NumberStreamStartFibonacci(self0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	Exports.NumberStream.StartFibonacci(self)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]number-stream.start-primes
+//export docs:calculator/calculate@0.1.0#[method]number-stream.start-primes
+func wasmexport_NumberStreamStartPrimes(self0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	Exports.NumberStream.StartPrimes(self)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]number-stream.start-squares
+//export docs:calculator/calculate@0.1.0#[method]number-stream.start-squares
+func wasmexport_NumberStreamStartSquares(self0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	Exports.NumberStream.StartSquares(self)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#[method]number-stream.stop
+//export docs:calculator/calculate@0.1.0#[method]number-stream.stop
+func wasmexport_NumberStreamStop(self0 uint32) {
+	self := cm.Reinterpret[cm.Rep]((uint32)(self0))
+	Exports.NumberStream.Stop(self)
+	return
+}
 
 //go:wasmexport docs:calculator/calculate@0.1.0#eval-expression
 //export docs:calculator/calculate@0.1.0#eval-expression
@@ -12,5 +150,40 @@ func wasmexport_EvalExpression(op0 uint32, x0 uint32, y0 uint32) (result *string
 	y := (uint32)((uint32)(y0))
 	result_ := Exports.EvalExpression(op, x, y)
 	result = &result_
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#eval-expression-detailed
+//export docs:calculator/calculate@0.1.0#eval-expression-detailed
+func wasmexport_EvalExpressionDetailed(op0 uint32, x0 uint32, y0 uint32) (result *CalcResult) {
+	op := (Op)((uint32)(op0))
+	x := (uint32)((uint32)(x0))
+	y := (uint32)((uint32)(y0))
+	result_ := Exports.EvalExpressionDetailed(op, x, y)
+	result = &result_
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#generate-fibonacci
+//export docs:calculator/calculate@0.1.0#generate-fibonacci
+func wasmexport_GenerateFibonacci(maxCount0 uint32) {
+	maxCount := (uint32)((uint32)(maxCount0))
+	Exports.GenerateFibonacci(maxCount)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#generate-squares
+//export docs:calculator/calculate@0.1.0#generate-squares
+func wasmexport_GenerateSquares(maxCount0 uint32) {
+	maxCount := (uint32)((uint32)(maxCount0))
+	Exports.GenerateSquares(maxCount)
+	return
+}
+
+//go:wasmexport docs:calculator/calculate@0.1.0#generate-primes
+//export docs:calculator/calculate@0.1.0#generate-primes
+func wasmexport_GeneratePrimes(maxCount0 uint32) {
+	maxCount := (uint32)((uint32)(maxCount0))
+	Exports.GeneratePrimes(maxCount)
 	return
 }

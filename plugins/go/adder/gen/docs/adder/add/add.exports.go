@@ -8,4 +8,14 @@ var Exports struct {
 	//
 	//	add: func(x: u32, y: u32) -> u32
 	Add func(x uint32, y uint32) (result uint32)
+
+	// Sub represents the caller-defined, exported function "sub".
+	//
+	//	sub: func(x: u32, y: u32) -> u32
+	Sub func(x uint32, y uint32) (result uint32)
+
+	// Mul represents the caller-defined, exported function "mul".
+	//
+	//	mul: func(x: u32, y: u32) -> u32
+	Mul func(x uint32, y uint32) (result uint32)
 }

@@ -1,8 +1,5 @@
 """
-Python host for WASM calculator components (reactor mode).
-
-Uses wasmtime-py's component model API to load a composed calculator
-component and call its exported eval-expression function.
+Python host for WASM calculator components.
 
 Usage:
     uv run python3 host.py <path-to-composed-component.wasm>
@@ -14,24 +11,41 @@ Example:
 
 import sys
 import os
-from wasmtime import Engine, Store, Config
+from wasmtime import Engine, Store
 from wasmtime.component import Component, Linker
 
 
 def run(wasm_path: str):
-    # Enable the component model
-    config = Config()
-    config.wasm_component_model = True
-    engine = Engine(config)
+    engine = Engine()
     store = Store(engine)
+
+    # Set up linker
+    linker = Linker(engine)
+
+    # Stream-sink implementation
+    collected_numbers = []
+
+    def on_number_handler(store, value: int) -> bool:
+        collected_numbers.append(value)
+        return True
+
+    def on_done_handler(store):
+        pass
+
+    # Register stream-sink implementation
+    try:
+        with linker.root() as root:
+            sink = root.add_instance("docs:calculator/stream-sink@0.1.0")
+            sink.add_func("on-number", on_number_handler)
+            sink.add_func("on-done", on_done_handler)
+    except Exception as e:
+        print(f"Warning: Could not register stream-sink: {e}")
+        print("Streaming features may not work")
 
     # Load the composed component
     component = Component.from_file(engine, wasm_path)
 
-    # Set up linker (no WASI needed - components are built without WASI imports)
-    linker = Linker(engine)
-
-    # Instantiate the component (reactor mode: no _start, just exports)
+    # Instantiate the component
     instance = linker.instantiate(store, component)
 
     # Navigate to the exported interface: docs:calculator/calculate@0.1.0
@@ -40,7 +54,7 @@ def run(wasm_path: str):
         print("Error: could not find export 'docs:calculator/calculate@0.1.0'")
         sys.exit(1)
 
-    # Get the eval-expression function from the interface
+    # Get the eval-expression function
     func_idx = instance.get_export_index(store, "eval-expression", iface_idx)
     if func_idx is None:
         print("Error: could not find function 'eval-expression'")
@@ -51,20 +65,22 @@ def run(wasm_path: str):
         print("Error: could not get function 'eval-expression'")
         sys.exit(1)
 
-    # Call eval-expression with op="add", x=1, y=2
-    # The WIT enum 'op' is passed as a string matching the enum case name
+    # Test basic operations
     result = eval_expr(store, "add", 1, 2)
     eval_expr.post_return(store)
-    print(f"Result: {result}")
+    print(f"add(1,2) = {result}")
 
-    # Try a few more examples
-    result2 = eval_expr(store, "add", 100, 200)
+    result = eval_expr(store, "sub", 10, 3)
     eval_expr.post_return(store)
-    print(f"Result: {result2}")
+    print(f"sub(10,3) = {result}")
 
-    result3 = eval_expr(store, "add", 0, 0)
+    result = eval_expr(store, "mul", 4, 5)
     eval_expr.post_return(store)
-    print(f"Result: {result3}")
+    print(f"mul(4,5) = {result}")
+
+    print(
+        "\nNote: Full feature testing (resources, streaming) to be added after successful build"
+    )
 
 
 if __name__ == "__main__":

@@ -10,16 +10,22 @@ import (
 // Op represents the enum "docs:calculator/calculate@0.1.0#op".
 //
 //	enum op {
-//		add
+//		add,
+//		sub,
+//		mul
 //	}
 type Op uint8
 
 const (
 	OpAdd Op = iota
+	OpSub
+	OpMul
 )
 
-var _OpStrings = [1]string{
+var _OpStrings = [3]string{
 	"add",
+	"sub",
+	"mul",
 }
 
 // String implements [fmt.Stringer], returning the enum case name of e.
@@ -39,3 +45,107 @@ func (e *Op) UnmarshalText(text []byte) error {
 }
 
 var _OpUnmarshalCase = cm.CaseUnmarshaler[Op](_OpStrings[:])
+
+// CalcResult represents the record "docs:calculator/calculate@0.1.0#calc-result".
+//
+//	record calc-result {
+//		value: u32,
+//		op: string,
+//		x: u32,
+//		y: u32,
+//	}
+type CalcResult struct {
+	_     cm.HostLayout `json:"-"`
+	Value uint32        `json:"value"`
+	Op    string        `json:"op"`
+	X     uint32        `json:"x"`
+	Y     uint32        `json:"y"`
+}
+
+// CalcSession represents the exported resource "docs:calculator/calculate@0.1.0#calc-session".
+//
+//	resource calc-session
+type CalcSession cm.Resource
+
+// CalcSessionResourceNew represents the imported resource-new for resource "calc-session".
+//
+// Creates a new resource handle.
+//
+//go:nosplit
+func CalcSessionResourceNew(rep cm.Rep) (result CalcSession) {
+	rep0 := cm.Reinterpret[uint32](rep)
+	result0 := wasmimport_CalcSessionResourceNew((uint32)(rep0))
+	result = cm.Reinterpret[CalcSession]((uint32)(result0))
+	return
+}
+
+// ResourceRep represents the imported resource-rep for resource "calc-session".
+//
+// Returns the underlying resource representation.
+//
+//go:nosplit
+func (self CalcSession) ResourceRep() (result cm.Rep) {
+	self0 := cm.Reinterpret[uint32](self)
+	result0 := wasmimport_CalcSessionResourceRep((uint32)(self0))
+	result = cm.Reinterpret[cm.Rep]((uint32)(result0))
+	return
+}
+
+// ResourceDrop represents the imported resource-drop for resource "calc-session".
+//
+// Drops a resource handle.
+//
+//go:nosplit
+func (self CalcSession) ResourceDrop() {
+	self0 := cm.Reinterpret[uint32](self)
+	wasmimport_CalcSessionResourceDrop((uint32)(self0))
+	return
+}
+
+func init() {
+	Exports.CalcSession.Destructor = func(self cm.Rep) {}
+}
+
+// NumberStream represents the exported resource "docs:calculator/calculate@0.1.0#number-stream".
+//
+//	resource number-stream
+type NumberStream cm.Resource
+
+// NumberStreamResourceNew represents the imported resource-new for resource "number-stream".
+//
+// Creates a new resource handle.
+//
+//go:nosplit
+func NumberStreamResourceNew(rep cm.Rep) (result NumberStream) {
+	rep0 := cm.Reinterpret[uint32](rep)
+	result0 := wasmimport_NumberStreamResourceNew((uint32)(rep0))
+	result = cm.Reinterpret[NumberStream]((uint32)(result0))
+	return
+}
+
+// ResourceRep represents the imported resource-rep for resource "number-stream".
+//
+// Returns the underlying resource representation.
+//
+//go:nosplit
+func (self NumberStream) ResourceRep() (result cm.Rep) {
+	self0 := cm.Reinterpret[uint32](self)
+	result0 := wasmimport_NumberStreamResourceRep((uint32)(self0))
+	result = cm.Reinterpret[cm.Rep]((uint32)(result0))
+	return
+}
+
+// ResourceDrop represents the imported resource-drop for resource "number-stream".
+//
+// Drops a resource handle.
+//
+//go:nosplit
+func (self NumberStream) ResourceDrop() {
+	self0 := cm.Reinterpret[uint32](self)
+	wasmimport_NumberStreamResourceDrop((uint32)(self0))
+	return
+}
+
+func init() {
+	Exports.NumberStream.Destructor = func(self cm.Rep) {}
+}

@@ -13,3 +13,23 @@ func wasmexport_Add(x0 uint32, y0 uint32) (result0 uint32) {
 	result0 = (uint32)(result)
 	return
 }
+
+//go:wasmexport docs:adder/add@0.1.0#sub
+//export docs:adder/add@0.1.0#sub
+func wasmexport_Sub(x0 uint32, y0 uint32) (result0 uint32) {
+	x := (uint32)((uint32)(x0))
+	y := (uint32)((uint32)(y0))
+	result := Exports.Sub(x, y)
+	result0 = (uint32)(result)
+	return
+}
+
+//go:wasmexport docs:adder/add@0.1.0#mul
+//export docs:adder/add@0.1.0#mul
+func wasmexport_Mul(x0 uint32, y0 uint32) (result0 uint32) {
+	x := (uint32)((uint32)(x0))
+	y := (uint32)((uint32)(y0))
+	result := Exports.Mul(x, y)
+	result0 = (uint32)(result)
+	return
+}

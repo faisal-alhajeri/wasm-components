@@ -7,3 +7,11 @@ package add
 //go:wasmimport docs:adder/add@0.1.0 add
 //go:noescape
 func wasmimport_Add(x0 uint32, y0 uint32) (result0 uint32)
+
+//go:wasmimport docs:adder/add@0.1.0 sub
+//go:noescape
+func wasmimport_Sub(x0 uint32, y0 uint32) (result0 uint32)
+
+//go:wasmimport docs:adder/add@0.1.0 mul
+//go:noescape
+func wasmimport_Mul(x0 uint32, y0 uint32) (result0 uint32)

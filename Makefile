@@ -6,17 +6,19 @@
 #   - jco + @bytecodealliance/componentize-js (npm -g)
 #   - uv (Python package manager)
 #   - node (>= 22)
+#   - wkg (wasm package tool)
 
 .PHONY: all clean plugins-go plugins-js compose hosts-transpile \
         run-python-go run-python-js run-ts-go run-ts-js run-all
 
 BUILD_DIR := build
 
-# ─── Go Plugins (TinyGo → wasm-unknown → wasm-tools component) ───────────────
+# ─── Go Plugins (TinyGo → component) ─────────────────────────────────────────
 
 GO_ADDER_DIR     := plugins/go/adder
 GO_CALC_DIR      := plugins/go/calculator
 
+# Go adder: wasm-unknown target (no WASI imports needed)
 $(BUILD_DIR)/go-adder.wasm: $(GO_ADDER_DIR)/main.go wit/adder/world.wit
 	@echo "==> Building Go adder plugin"
 	cd $(GO_ADDER_DIR) && tinygo build -target=wasm-unknown -o adder-core.wasm .
@@ -25,6 +27,7 @@ $(BUILD_DIR)/go-adder.wasm: $(GO_ADDER_DIR)/main.go wit/adder/world.wit
 	cp $(GO_ADDER_DIR)/adder.wasm $@
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
 
+# Go calculator: wasm-unknown target
 $(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go wit/calculator/world.wit
 	@echo "==> Building Go calculator plugin"
 	cd $(GO_CALC_DIR) && tinygo build -target=wasm-unknown -o calculator-core.wasm .
@@ -32,8 +35,6 @@ $(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go wit/calculator/world.wit
 	cd $(GO_CALC_DIR) && wasm-tools component new calculator-embedded.wasm -o calculator.wasm
 	cp $(GO_CALC_DIR)/calculator.wasm $@
 	rm -f $(GO_CALC_DIR)/calculator-core.wasm $(GO_CALC_DIR)/calculator-embedded.wasm $(GO_CALC_DIR)/calculator.wasm
-
-plugins-go: $(BUILD_DIR)/go-adder.wasm $(BUILD_DIR)/go-calculator.wasm
 
 # ─── JS Plugins (jco componentize) ────────────────────────────────────────────
 
@@ -55,6 +56,8 @@ $(BUILD_DIR)/js-calculator.wasm: $(JS_CALC_DIR)/calculator.js wit/calculator/wor
 		--world-name calculator \
 		--out $@ \
 		--disable all
+
+plugins-go: $(BUILD_DIR)/go-adder.wasm $(BUILD_DIR)/go-calculator.wasm
 
 plugins-js: $(BUILD_DIR)/js-adder.wasm $(BUILD_DIR)/js-calculator.wasm
 
@@ -112,5 +115,5 @@ clean:
 	rm -rf $(BUILD_DIR)/*.wasm
 	rm -rf $(TS_HOST_DIR)/transpiled-go $(TS_HOST_DIR)/transpiled-js
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
-	rm -f $(GO_CALC_DIR)/calculator-core.wasm $(GO_CALC_DIR)/calculator-embedded.wasm $(GO_CALC_DIR)/calculator.wasm
+	rm -f $(GO_CALC_DIR)/calculator.wasm
 	@echo "==> Cleaned build artifacts"
