@@ -1,0 +1,5 @@
+- use wac
+- refactor wit repeat
+- dont use transpile
+- use wasi2p insted of wasi-unknown
+- reactor mode more
