@@ -2,7 +2,8 @@
 #
 # Prerequisites:
 #   - tinygo (>= 0.33)
-#   - wasm-tools
+#   - wasm-tools (for component new/embed)
+#   - wac-cli (for component composition)
 #   - jco + @bytecodealliance/componentize-js (npm -g)
 #   - uv (Python package manager)
 #   - node (>= 22)
@@ -61,18 +62,18 @@ plugins-go: $(BUILD_DIR)/go-adder.wasm $(BUILD_DIR)/go-calculator.wasm
 
 plugins-js: $(BUILD_DIR)/js-adder.wasm $(BUILD_DIR)/js-calculator.wasm
 
-# ─── Compose (wasm-tools compose: calculator + adder → composed) ──────────────
+# ─── Compose (wac plug: calculator + adder → composed) ──────────────
 
 $(BUILD_DIR)/composed-go.wasm: $(BUILD_DIR)/go-calculator.wasm $(BUILD_DIR)/go-adder.wasm
 	@echo "==> Composing Go calculator + adder"
-	wasm-tools compose $(BUILD_DIR)/go-calculator.wasm \
-		-d $(BUILD_DIR)/go-adder.wasm \
+	wac plug $(BUILD_DIR)/go-calculator.wasm \
+		--plug $(BUILD_DIR)/go-adder.wasm \
 		-o $@
 
 $(BUILD_DIR)/composed-js.wasm: $(BUILD_DIR)/js-calculator.wasm $(BUILD_DIR)/js-adder.wasm
 	@echo "==> Composing JS calculator + adder"
-	wasm-tools compose $(BUILD_DIR)/js-calculator.wasm \
-		-d $(BUILD_DIR)/js-adder.wasm \
+	wac plug $(BUILD_DIR)/js-calculator.wasm \
+		--plug $(BUILD_DIR)/js-adder.wasm \
 		-o $@
 
 compose: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm

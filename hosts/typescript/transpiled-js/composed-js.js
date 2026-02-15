@@ -1945,7 +1945,7 @@ let gen = (function* _initGenerator () {
       
     }
   }
-  ({ exports: exports0 } = instantiateCore(module1));
+  ({ exports: exports0 } = instantiateCore(module0));
   ({ exports: exports1 } = instantiateCore(module2, {
     callee: {
       adapter0: exports0['docs:adder/add@0.1.0#add'],
@@ -1962,7 +1962,7 @@ let gen = (function* _initGenerator () {
       adapter2: exports0['cabi_post_docs:adder/add@0.1.0#mul'],
     },
   }));
-  ({ exports: exports2 } = instantiateCore(module0, {
+  ({ exports: exports2 } = instantiateCore(module1, {
     '[export]docs:calculator/calculate@0.1.0': {
       '[resource-drop]calc-session': trampoline4,
       '[resource-drop]number-stream': trampoline7,

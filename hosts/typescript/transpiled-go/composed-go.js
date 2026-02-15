@@ -1892,13 +1892,13 @@ let gen = (function* _initGenerator () {
     ),
   });
   
-  ({ exports: exports0 } = instantiateCore(module4));
-  ({ exports: exports1 } = instantiateCore(module5, {
+  ({ exports: exports0 } = instantiateCore(module0));
+  ({ exports: exports1 } = instantiateCore(module1, {
     '': {
       '': exports0._initialize,
     },
   }));
-  ({ exports: exports2 } = instantiateCore(module1));
+  ({ exports: exports2 } = instantiateCore(module3));
   ({ exports: exports3 } = instantiateCore(module6, {
     callee: {
       adapter0: exports0['docs:adder/add@0.1.0#add'],
@@ -1910,7 +1910,7 @@ let gen = (function* _initGenerator () {
       instance3: instanceFlags3,
     },
   }));
-  ({ exports: exports4 } = instantiateCore(module0, {
+  ({ exports: exports4 } = instantiateCore(module2, {
     'docs:adder/add@0.1.0': {
       add: exports3.adapter0,
       mul: exports3.adapter2,
@@ -1921,14 +1921,14 @@ let gen = (function* _initGenerator () {
       'on-number': trampoline0,
     },
   }));
-  ({ exports: exports5 } = instantiateCore(module2, {
+  ({ exports: exports5 } = instantiateCore(module4, {
     '': {
       $imports: exports2.$imports,
       '0': exports4['docs:calculator/calculate@0.1.0#[dtor]calc-session'],
       '1': exports4['docs:calculator/calculate@0.1.0#[dtor]number-stream'],
     },
   }));
-  ({ exports: exports6 } = instantiateCore(module3, {
+  ({ exports: exports6 } = instantiateCore(module5, {
     '': {
       '': exports4._initialize,
     },

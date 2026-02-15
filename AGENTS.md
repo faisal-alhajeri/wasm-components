@@ -1,6 +1,6 @@
 # Agent Guide: WASM Component Model Project
 
-This repository explores the WebAssembly (WASM) Component Model, featuring plugins in Go and JavaScript, composition via `wasm-tools`, and hosts in Python and TypeScript.
+This repository explores the WebAssembly (WASM) Component Model, featuring plugins in Go and JavaScript, composition via `wac-cli`, and hosts in Python and TypeScript.
 
 the goal here is to learn the Component Model so we will do stuff only for learning.
 
@@ -11,7 +11,8 @@ The project uses a `Makefile` in `tests/components/` to orchestrate builds and r
 ### Prerequisites
 
 - **TinyGo** (>= 0.33)
-- **wasm-tools**
+- **wasm-tools** (for component new/embed)
+- **wac-cli** (for component composition)
 - **jco** & **@bytecodealliance/componentize-js** (global npm)
 - **uv** (Python package manager)
 - **Node.js** (>= 22)
