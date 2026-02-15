@@ -19,31 +19,15 @@ def run(wasm_path: str):
     engine = Engine()
     store = Store(engine)
 
+    # Load the composed component
+    component = Component.from_file(engine, wasm_path)
+
     # Set up linker
     linker = Linker(engine)
 
-    # Stream-sink implementation
-    collected_numbers = []
-
-    def on_number_handler(store, value: int) -> bool:
-        collected_numbers.append(value)
-        return True
-
-    def on_done_handler(store):
-        pass
-
-    # Register stream-sink implementation
-    try:
-        with linker.root() as root:
-            sink = root.add_instance("docs:calculator/stream-sink@0.1.0")
-            sink.add_func("on-number", on_number_handler)
-            sink.add_func("on-done", on_done_handler)
-    except Exception as e:
-        print(f"Warning: Could not register stream-sink: {e}")
-        print("Streaming features may not work")
-
-    # Load the composed component
-    component = Component.from_file(engine, wasm_path)
+    # Allow unknown imports (stream-sink) to be trapped gracefully
+    # This lets basic functions work while streaming features remain to be implemented
+    linker.define_unknown_imports_as_traps(component)
 
     # Instantiate the component
     instance = linker.instantiate(store, component)

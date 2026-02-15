@@ -83,8 +83,8 @@ TS_HOST_DIR := hosts/typescript
 
 hosts-transpile: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm
 	@echo "==> Transpiling components for TypeScript host"
-	jco transpile $(BUILD_DIR)/composed-go.wasm -o $(TS_HOST_DIR)/transpiled-go --name composed-go
-	jco transpile $(BUILD_DIR)/composed-js.wasm -o $(TS_HOST_DIR)/transpiled-js --name composed-js
+	jco transpile $(BUILD_DIR)/composed-go.wasm -o $(TS_HOST_DIR)/transpiled-go --name composed-go --instantiation sync
+	jco transpile $(BUILD_DIR)/composed-js.wasm -o $(TS_HOST_DIR)/transpiled-js --name composed-js --instantiation sync
 
 # ─── Run targets ──────────────────────────────────────────────────────────────
 
