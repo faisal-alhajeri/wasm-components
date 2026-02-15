@@ -2,11 +2,14 @@
 
 This repository explores the WebAssembly (WASM) Component Model, featuring plugins in Go and JavaScript, composition via `wasm-tools`, and hosts in Python and TypeScript.
 
+the goal here is to learn the Component Model so we will do stuff only for learning.
+
 ## 1. Build, Lint, and Test Commands
 
 The project uses a `Makefile` in `tests/components/` to orchestrate builds and runs.
 
 ### Prerequisites
+
 - **TinyGo** (>= 0.33)
 - **wasm-tools**
 - **jco** & **@bytecodealliance/componentize-js** (global npm)
@@ -14,6 +17,7 @@ The project uses a `Makefile` in `tests/components/` to orchestrate builds and r
 - **Node.js** (>= 22)
 
 ### Build Commands
+
 Run these from `tests/components/`:
 
 - **Build all:**
@@ -38,6 +42,7 @@ Run these from `tests/components/`:
   ```
 
 ### Run/Test Commands
+
 Each host can run against the composed components (Go or JS variants).
 
 - **Run All Hosts:**
@@ -68,6 +73,7 @@ Each host can run against the composed components (Go or JS variants).
 ## 2. Code Style & Conventions
 
 ### General
+
 - **Structure:**
   - `plugins/`: Source code for WASM components (Go, JS).
   - `hosts/`: Host applications (Python, TypeScript).
@@ -76,6 +82,7 @@ Each host can run against the composed components (Go or JS variants).
 - **Paths:** Always use relative paths resolving correctly from the execution context (usually `tests/components/`).
 
 ### Go (Plugins)
+
 - **Compiler:** `tinygo build -target=wasm-unknown`.
 - **Bindings:** Use `go tool wit-bindgen-go` (via `//go:generate`).
 - **Exports:**
@@ -91,17 +98,21 @@ Each host can run against the composed components (Go or JS variants).
 - **Formatting:** Standard `gofmt`.
 
 ### JavaScript (Plugins)
+
 - **Tooling:** `jco componentize` to create the WASM component.
 - **Modules:** Use ES Modules (`export const ...`).
 - **Structure:** Export objects matching the WIT interface names.
 - **Example:**
   ```javascript
   export const add = {
-    add(x, y) { return x + y; } // Implementation matches WIT
+    add(x, y) {
+      return x + y;
+    }, // Implementation matches WIT
   };
   ```
 
 ### TypeScript (Host)
+
 - **Execution:** Node.js with `--experimental-wasm-type-reflection`.
 - **Transpilation:** Consumes output from `jco transpile`.
 - **Imports:** Dynamic imports for flexibility (e.g., `await import("./transpiled-go/...")`).
@@ -110,6 +121,7 @@ Each host can run against the composed components (Go or JS variants).
 - **Error Handling:** Check process arguments and handle invalid variants gracefully.
 
 ### Python (Host)
+
 - **Runtime:** `wasmtime` library.
 - **Dependency Management:** Use `uv`.
 - **Component Loading:**
@@ -122,11 +134,13 @@ Each host can run against the composed components (Go or JS variants).
 - **Usage:** CLI arguments for WASM file path.
 
 ### WIT (Wasm Interface Type)
+
 - **Location:** `wit/` directory or inside plugin directories.
 - **Naming:** Kebab-case for file names and identifiers.
 - **Worlds:** Define explicitly what is imported and exported.
 
 ## 3. Workflow for Agents
+
 1.  **Modify WIT:** If interfaces change, update `wit/*.wit` files first.
 2.  **Regenerate Bindings:** Run generation commands (e.g., `go generate`) if applicable.
 3.  **Implement:** Update plugin code (Go/JS).

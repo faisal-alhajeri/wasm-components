@@ -17,18 +17,18 @@ BUILD_DIR := build
 GO_ADDER_DIR     := plugins/go/adder
 GO_CALC_DIR      := plugins/go/calculator
 
-$(BUILD_DIR)/go-adder.wasm: $(GO_ADDER_DIR)/main.go $(GO_ADDER_DIR)/wit/world.wit
+$(BUILD_DIR)/go-adder.wasm: $(GO_ADDER_DIR)/main.go wit/adder/world.wit
 	@echo "==> Building Go adder plugin"
 	cd $(GO_ADDER_DIR) && tinygo build -target=wasm-unknown -o adder-core.wasm .
-	cd $(GO_ADDER_DIR) && wasm-tools component embed --world adder wit adder-core.wasm -o adder-embedded.wasm
+	cd $(GO_ADDER_DIR) && wasm-tools component embed --world adder ../../../wit/adder adder-core.wasm -o adder-embedded.wasm
 	cd $(GO_ADDER_DIR) && wasm-tools component new adder-embedded.wasm -o adder.wasm
 	cp $(GO_ADDER_DIR)/adder.wasm $@
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
 
-$(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go $(GO_CALC_DIR)/wit/world.wit
+$(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go wit/calculator/world.wit
 	@echo "==> Building Go calculator plugin"
 	cd $(GO_CALC_DIR) && tinygo build -target=wasm-unknown -o calculator-core.wasm .
-	cd $(GO_CALC_DIR) && wasm-tools component embed --world calculator wit calculator-core.wasm -o calculator-embedded.wasm
+	cd $(GO_CALC_DIR) && wasm-tools component embed --world calculator ../../../wit/calculator calculator-core.wasm -o calculator-embedded.wasm
 	cd $(GO_CALC_DIR) && wasm-tools component new calculator-embedded.wasm -o calculator.wasm
 	cp $(GO_CALC_DIR)/calculator.wasm $@
 	rm -f $(GO_CALC_DIR)/calculator-core.wasm $(GO_CALC_DIR)/calculator-embedded.wasm $(GO_CALC_DIR)/calculator.wasm
@@ -48,10 +48,10 @@ $(BUILD_DIR)/js-adder.wasm: $(JS_ADDER_DIR)/adder.js wit/adder/world.wit
 		--out $@ \
 		--disable all
 
-$(BUILD_DIR)/js-calculator.wasm: $(JS_CALC_DIR)/calculator.js $(JS_CALC_DIR)/wit/world.wit
+$(BUILD_DIR)/js-calculator.wasm: $(JS_CALC_DIR)/calculator.js wit/calculator/world.wit
 	@echo "==> Building JS calculator plugin"
 	jco componentize $(JS_CALC_DIR)/calculator.js \
-		--wit $(JS_CALC_DIR)/wit \
+		--wit wit/calculator \
 		--world-name calculator \
 		--out $@ \
 		--disable all

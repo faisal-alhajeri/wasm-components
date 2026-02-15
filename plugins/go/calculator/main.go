@@ -1,4 +1,4 @@
-//go:generate go tool wit-bindgen-go generate --world calculator --out gen ./wit
+//go:generate go tool wit-bindgen-go generate --world calculator --out gen ../../../wit/calculator
 
 package main
 
