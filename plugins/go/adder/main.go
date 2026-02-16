@@ -1,4 +1,4 @@
-//go:generate go tool wit-bindgen-go generate --world adder --out gen ../../../wit/adder
+//go:generate go tool wit-bindgen-go generate --world adder --out gen adder-pkg.wasm
 
 package main
 
