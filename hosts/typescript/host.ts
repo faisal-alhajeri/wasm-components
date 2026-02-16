@@ -18,6 +18,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import { WASIShim } from "@bytecodealliance/preview2-shim/instantiation";
 
 async function main() {
   const variant = process.argv[2] || "go";
@@ -62,8 +63,8 @@ async function main() {
     },
   };
 
-  // Note: The transpiled code accesses imports without version suffix
   const imports = {
+    ...new WASIShim().getImportObject(),
     "docs:calculator/stream-sink": streamSinkImpl,
   };
 
