@@ -578,10 +578,37 @@ export function instantiate(getCoreModule, imports, instantiateCore = (module, i
   let dv = new DataView(new ArrayBuffer());
   const dataView = mem => dv.buffer === mem.buffer ? dv : dv = new DataView(mem.buffer);
   
+  const toUint64 = val => BigInt.asUintN(64, BigInt(val));
+  
+  function toUint16(val) {
+    val >>>= 0;
+    val %= 2 ** 16;
+    return val;
+  }
+  
   function toUint32(val) {
     return val >>> 0;
   }
+  
+  function toUint8(val) {
+    val >>>= 0;
+    val %= 2 ** 8;
+    return val;
+  }
   const TEXT_DECODER_UTF8 = new TextDecoder();
+  const TEXT_ENCODER_UTF8 = new TextEncoder();
+  
+  function _utf8AllocateAndEncode(s, realloc, memory) {
+    if (typeof s !== 'string') {
+      throw new TypeError('expected a string, received [' + typeof s + ']');
+    }
+    if (s.length === 0) { return { ptr: 1, len: 0 }; }
+    let buf = TEXT_ENCODER_UTF8.encode(s);
+    let ptr = realloc(0, 0, 1, buf.length);
+    new Uint8Array(memory.buffer).set(buf, ptr);
+    return { ptr, len: buf.length, codepoints: [...s].length };
+  }
+  
   
   const T_FLAG = 1 << 30;
   
@@ -610,6 +637,8 @@ export function instantiate(getCoreModule, imports, instantiateCore = (module, i
     table[0] = handle | T_FLAG;
     return { rep, scope, own };
   }
+  
+  let curResourceBorrows = [];
   
   function getCurrentTask(componentIdx) {
     if (componentIdx === undefined || componentIdx === null) {
@@ -1301,6 +1330,69 @@ function _lowerImport(args, exportFn) {
   return Number(subtask.waitableRep()) << 4 | subtaskState;
 }
 
+function _liftFlatBool(ctx) {
+  _debugLog('[_liftFlatBool()] args', { ctx });
+  let val;
+  
+  if (ctx.useDirectParams) {
+    if (ctx.params.length === 0) { throw new Error('expected at least a single i32 argument'); }
+    val = ctx.params[0] === 1;
+    ctx.params = ctx.params.slice(1);
+    return [val, ctx];
+  }
+  
+  if (ctx.storageLen !== undefined && ctx.storageLen < ctx.storagePtr + 1) {
+    throw new Error('not enough storage remaining for lift');
+  }
+  val = new DataView(ctx.memory.buffer).getUint8(ctx.storagePtr, true) === 1;
+  ctx.storagePtr += 1;
+  if (ctx.storageLen !== undefined) { ctx.storageLen -= 1; }
+  
+  return [val, ctx];
+}
+
+function _liftFlatU8(ctx) {
+  _debugLog('[_liftFlatU8()] args', { ctx });
+  let val;
+  
+  if (ctx.useDirectParams) {
+    if (ctx.params.length === 0) { throw new Error('expected at least a single i32 argument'); }
+    val = ctx.params[0];
+    ctx.params = ctx.params.slice(1);
+    return [val, ctx];
+  }
+  
+  if (ctx.storageLen !== undefined && ctx.storageLen < ctx.storagePtr + 1) {
+    throw new Error('not enough storage remaining for lift');
+  }
+  val = new DataView(ctx.memory.buffer).getUint8(ctx.storagePtr, true);
+  ctx.storagePtr += 1;
+  if (ctx.storageLen !== undefined) { ctx.storageLen -= 1; }
+  
+  return [val, ctx];
+}
+
+function _liftFlatU16(ctx) {
+  _debugLog('[_liftFlatU16()] args', { ctx });
+  let val;
+  
+  if (ctx.useDirectParams) {
+    if (params.length === 0) { throw new Error('expected at least a single i32 argument'); }
+    val = ctx.params[0];
+    ctx.params = ctx.params.slice(1);
+    return [val, ctx];
+  }
+  
+  if (ctx.storageLen !== undefined && ctx.storageLen < ctx.storagePtr + 2) {
+    throw new Error('not enough storage remaining for lift');
+  }
+  val = new DataView(ctx.memory.buffer).getUint16(ctx.storagePtr, true);
+  ctx.storagePtr += 2;
+  if (ctx.storageLen !== undefined) { ctx.storageLen -= 2; }
+  
+  return [val, ctx];
+}
+
 function _liftFlatU32(ctx) {
   _debugLog('[_liftFlatU32()] args', { ctx });
   let val;
@@ -1322,6 +1414,215 @@ function _liftFlatU32(ctx) {
   return [val, ctx];
 }
 
+function _liftFlatU64(ctx) {
+  _debugLog('[_liftFlatU64()] args', { ctx });
+  let val;
+  
+  if (ctx.useDirectParams) {
+    if (ctx.params.length === 0) { throw new Error('expected at least one single i64 argument'); }
+    if (typeof ctx.params[0] !== 'bigint') { throw new Error('expected bigint'); }
+    val = ctx.params[0];
+    ctx.params = ctx.params.slice(1);
+    return [val, ctx];
+  }
+  
+  if (ctx.storageLen !== undefined && ctx.storageLen < ctx.storagePtr + 8) {
+    throw new Error('not enough storage remaining for lift');
+  }
+  val = new DataView(ctx.memory.buffer).getUint64(ctx.storagePtr, true);
+  ctx.storagePtr += 8;
+  if (ctx.storageLen !== undefined) { ctx.storageLen -= 8; }
+  
+  return [val, ctx];
+}
+
+function _liftFlatStringUTF8(ctx) {
+  _debugLog('[_liftFlatStringUTF8()] args', { ctx });
+  let val;
+  
+  if (ctx.useDirectParams) {
+    if (ctx.params.length < 2) { throw new Error('expected at least two u32 arguments'); }
+    const offset = ctx.params[0];
+    if (!Number.isSafeInteger(offset)) {  throw new Error('invalid offset'); }
+    const len = ctx.params[1];
+    if (!Number.isSafeInteger(len)) {  throw new Error('invalid len'); }
+    val = TEXT_DECODER_UTF8.decode(new DataView(ctx.memory.buffer, offset, len));
+    ctx.params = ctx.params.slice(2);
+    return [val, ctx];
+  }
+  
+  const start = new DataView(ctx.memory.buffer).getUint32(ctx.storagePtr, params[0], true);
+  const codeUnits = new DataView(memory.buffer).getUint32(ctx.storagePtr, params[0] + 4, true);
+  val = TEXT_DECODER_UTF8.decode(new Uint8Array(ctx.memory.buffer, start, codeUnits));
+  ctx.storagePtr += codeUnits;
+  if (ctx.storageLen !== undefined) { ctx.storageLen -= codeUnits; }
+  
+  return [val, ctx];
+}
+
+function _liftFlatRecord(keysAndLiftFns) {
+  return function _liftFlatRecordInner(ctx) {
+    _debugLog('[_liftFlatRecord()] args', { ctx });
+    const { memory, useDirectParams, storagePtr, storageLen, params } = ctx;
+    
+    if (useDirectParams) {
+      storagePtr = params[0]
+    }
+    
+    const res = {};
+    for (const [key, liftFn, alignment32] in keysAndLiftFns) {
+      ctx.storagePtr = Math.ceil(ctx.storagePtr / alignment32) * alignment32;
+      let [val, newCtx] = liftFn(ctx);
+      res[key] = val;
+      ctx = newCtx;
+    }
+    
+    return res;
+  }
+}
+
+function _liftFlatVariant(casesAndLiftFns) {
+  return function _liftFlatVariantInner(ctx) {
+    _debugLog('[_liftFlatVariant()] args', { ctx });
+    
+    const origUseParams = ctx.useDirectParams;
+    
+    let caseIdx;
+    if (casesAndLiftFns.length < 256) {
+      let discriminantByteLen = 1;
+      const [idx, newCtx] = _liftFlatU8(ctx);
+      caseIdx = idx;
+      ctx = newCtx;
+    } else if (casesAndLiftFns.length > 256 && discriminantByteLen < 65536) {
+      discriminantByteLen = 2;
+      const [idx, newCtx] = _liftFlatU16(ctx);
+      caseIdx = idx;
+      ctx = newCtx;
+    } else if (casesAndLiftFns.length > 65536 && discriminantByteLen < 4_294_967_296) {
+      discriminantByteLen = 4;
+      const [idx, newCtx] = _liftFlatU32(ctx);
+      caseIdx = idx;
+      ctx = newCtx;
+    } else {
+      throw new Error('unsupported number of cases [' + casesAndLIftFns.legnth + ']');
+    }
+    
+    const [ tag, liftFn, size32, alignment32 ] = casesAndLiftFns[caseIdx];
+    
+    let val;
+    if (liftFn === null) {
+      val = { tag };
+      return [val, ctx];
+    }
+    
+    const [newVal, newCtx] = liftFn(ctx);
+    ctx = newCtx;
+    val = { tag, val: newVal };
+    
+    return [val, ctx];
+  }
+}
+
+function _liftFlatList(elemLiftFn, alignment32, knownLen) {
+  function _liftFlatListInner(ctx) {
+    _debugLog('[_liftFlatList()] args', { ctx });
+    
+    let metaPtr;
+    let dataPtr;
+    let len;
+    if (ctx.useDirectParams) {
+      if (knownLen) {
+        dataPtr = _liftFlatU32(ctx);
+      } else {
+        metaPtr = _liftFlatU32(ctx);
+      }
+    } else {
+      if (knownLen) {
+        dataPtr = _liftFlatU32(ctx);
+      } else {
+        metaPtr = _liftFlatU32(ctx);
+      }
+    }
+    
+    if (metaPtr) {
+      if (dataPtr !== undefined) { throw new Error('both meta and data pointers should not be set yet'); }
+      
+      if (ctx.useDirectParams) {
+        ctx.useDirectParams = false;
+        ctx.storagePtr = metaPtr;
+        ctx.storageLen = 8;
+        
+        dataPtr = _liftFlatU32(ctx);
+        len = _liftFlatU32(ctx);
+        
+        ctx.useDirectParams = true;
+        ctx.storagePtr = null;
+        ctx.storageLen = null;
+      } else {
+        dataPtr = _liftFlatU32(ctx);
+        len = _liftFlatU32(ctx);
+      }
+    }
+    
+    const val = [];
+    for (var i = 0; i < len; i++) {
+      ctx.storagePtr = Math.ceil(ctx.storagePtr / alignment32) * alignment32;
+      const [res, nextCtx] = elemLiftFn(ctx);
+      val.push(res);
+      ctx = nextCtx;
+    }
+    
+    return [val, ctx];
+  }
+}
+
+function _liftFlatTuple(numberedLiftFns) {
+  return function _liftFlatTupleInner(ctx) {
+    _debugLog('[_liftFlatTuple()] args', { ctx });
+    
+    const obj = _liftFlatRecord(numberedLiftFns)(ctx);
+    const val = [];
+    for (var i = 0; i++; i < nubmeredLiftFns.length) {
+      val.push(obj[i]);
+    }
+    
+    return val;
+  }
+}
+
+function _liftFlatFlags(cases) {
+  return function _liftFlatFlagsInner(ctx) {
+    _debugLog('[_liftFlatFlags()] args', { ctx });
+    throw new Error('flat lift for flags not yet implemented!');
+  }
+}
+
+function _liftFlatEnum(casesAndLiftFns) {
+  return function _liftFlatEnumInner(ctx) {
+    _debugLog('[_liftFlatEnum()] args', { ctx });
+    return _liftFlatVariant(casesAndLiftFns)(ctx);
+  }
+}
+
+function _liftFlatOption(casesAndLiftFns) {
+  return function _liftFlatOptionInner(ctx) {
+    _debugLog('[_liftFlatOption()] args', { ctx });
+    return _liftFlatVariant(casesAndLiftFns)(ctx);
+  }
+}
+
+function _liftFlatResult(casesAndLiftFns) {
+  return function _liftFlatResultInner(ctx) {
+    _debugLog('[_liftFlatResult()] args', { ctx });
+    return _liftFlatVariant(casesAndLiftFns)(ctx);
+  }
+}
+
+function _liftFlatBorrow(componentTableIdx, size, memory, vals, storagePtr, storageLen) {
+  _debugLog('[_liftFlatBorrow()] args', { size, memory, vals, storagePtr, storageLen });
+  throw new Error('flat lift for borrowed resources not yet implemented!');
+}
+
 function _lowerFlatBool(memory, vals, storagePtr, storageLen) {
   _debugLog('[_lowerFlatBool()] args', { memory, vals, storagePtr, storageLen });
   if (vals.length !== 1) {
@@ -1330,6 +1631,227 @@ function _lowerFlatBool(memory, vals, storagePtr, storageLen) {
   if (vals[0] !== 0 && vals[0] !== 1) { throw new Error('invalid value for core value representing bool'); }
   new DataView(memory.buffer).setUint32(storagePtr, vals[0], true);
   return 1;
+}
+
+function _lowerFlatU8(ctx) {
+  _debugLog('[_lowerFlatU8()] args', ctx);
+  const { memory, realloc, vals, storagePtr, storageLen } = ctx;
+  if (vals.length !== 1) {
+    throw new Error('unexpected number (' + vals.length + ') of core vals (expected 1)');
+  }
+  if (vals[0] > 255 || vals[0] < 0) { throw new Error('invalid value for core value representing u8'); }
+  if (!memory) { throw new Error("missing memory for lower"); }
+  new DataView(memory.buffer).setUint32(storagePtr, vals[0], true);
+  return 1;
+}
+
+function _lowerFlatU16(memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatU16()] args', { memory, vals, storagePtr, storageLen });
+  if (vals.length !== 1) {
+    throw new Error('unexpected number (' + vals.length + ') of core vals (expected 1)');
+  }
+  if (vals[0] > 65_535 || vals[0] < 0) { throw new Error('invalid value for core value representing u16'); }
+  new DataView(memory.buffer).setUint16(storagePtr, vals[0], true);
+  return 2;
+}
+
+function _lowerFlatU32(ctx) {
+  _debugLog('[_lowerFlatU32()] args', { ctx });
+  const { memory, realloc, vals, storagePtr, storageLen } = ctx;
+  if (vals.length !== 1) { throw new Error('expected single value to lower, got (' + vals.length + ')'); }
+  if (vals[0] > 4_294_967_295 || vals[0] < 0) { throw new Error('invalid value for core value representing u32'); }
+  
+  // TODO(refactor): fail loudly on misaligned flat lowers?
+  const rem = ctx.storagePtr % 4;
+  if (rem !== 0) { ctx.storagePtr += (4 - rem); }
+  
+  new DataView(memory.buffer).setUint32(storagePtr, vals[0], true);
+  
+  return 4;
+}
+
+function _lowerFlatU64(memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatU64()] args', { memory, vals, storagePtr, storageLen });
+  if (vals.length !== 1) { throw new Error('unexpected number of core vals'); }
+  if (vals[0] > 18_446_744_073_709_551_615n || vals[0] < 0n) { throw new Error('invalid value for core value representing u64'); }
+  new DataView(memory.buffer).setBigUint64(storagePtr, vals[0], true);
+  return 8;
+}
+
+function _lowerFlatStringUTF8(ctx) {
+  _debugLog('[_lowerFlatStringUTF8()] args', ctx);
+  const { memory, realloc, vals, storagePtr, storageLen } = ctx;
+  
+  const s = vals[0];
+  const { ptr, len, codepoints } = _utf8AllocateAndEncode(vals[0], realloc, memory);
+  
+  const view = new DataView(memory.buffer);
+  view.setUint32(storagePtr, ptr, true);
+  view.setUint32(storagePtr + 4, codepoints, true);
+  
+  return len;
+}
+
+function _lowerFlatRecord(fieldMetas) {
+  return (size, memory, vals, storagePtr, storageLen) => {
+    const params = [...arguments].slice(5);
+    _debugLog('[_lowerFlatRecord()] args', {
+      size,
+      memory,
+      vals,
+      storagePtr,
+      storageLen,
+      params,
+      fieldMetas
+    });
+    
+    const [start] = vals;
+    if (storageLen !== undefined && size !== undefined && size > storageLen) {
+      throw new Error('not enough storage remaining for record flat lower');
+    }
+    const data = new Uint8Array(memory.buffer, start, size);
+    new Uint8Array(memory.buffer, storagePtr, size).set(data);
+    return data.byteLength;
+  }
+}
+
+function _lowerFlatVariant(metadata, extra) {
+  const { discriminantSizeBytes, lowerMetas } = metadata;
+  
+  return function _lowerFlatVariantInner(ctx) {
+    _debugLog('[_lowerFlatVariant()] args', ctx);
+    const { memory, realloc, vals, storageLen, componentIdx } = ctx;
+    let storagePtr = ctx.storagePtr;
+    
+    const { tag, val } = vals[0];
+    const variant = lowerMetas.find(vm => vm.tag === tag);
+    if (!variant) { throw new Error(`missing/invalid variant, no tag matches [${tag}] (options were ${variantMetas.map(vm => vm.tag)})`); }
+    if (!variant.discriminant) { throw new Error(`missing/invalid discriminant for variant [${variant}]`); }
+    
+    let bytesWritten;
+    let discriminantLowerArgs = { memory, realloc, vals: [variant.discriminant], storagePtr, componentIdx }
+    switch (discriminantSizeBytes) {
+      case 1:
+      bytesWritten = _lowerFlatU8(discriminantLowerArgs);
+      break;
+      case 2:
+      bytesWritten = _lowerFlatU16(discriminantLowerArgs);
+      break;
+      case 4:
+      bytesWritten = _lowerFlatU32(discriminantLowerArgs);
+      break;
+      default:
+      throw new Error(`unexpected discriminant size bytes [${discriminantSizeBytes}]`);
+    }
+    if (bytesWritten !== discriminantSizeBytes) {
+      throw new Error("unexpectedly wrote more bytes than discriminant");
+    }
+    storagePtr += bytesWritten;
+    
+    bytesWritten += variant.lowerFn({ memory, realloc, vals: [val], storagePtr, storageLen, componentIdx });
+    
+    return bytesWritten;
+  }
+}
+
+function _lowerFlatList(args) {
+  const { elemLowerFn } = args;
+  if (!elemLowerFn) { throw new TypeError("missing/invalid element lower fn for list"); }
+  
+  return function _lowerFlatListInner(ctx) {
+    _debugLog('[_lowerFlatList()] args', { ctx });
+    
+    if (ctx.params.length < 2) { throw new Error('insufficient params left to lower list'); }
+    const storagePtr = ctx.params[0];
+    const elemCount = ctx.params[1];
+    ctx.params = ctx.params.slice(2);
+    
+    if (ctx.useDirectParams) {
+      const list = ctx.vals[0];
+      if (!list) { throw new Error("missing direct param value"); }
+      
+      const elemLowerCtx = { storagePtr, memory: ctx.memory };
+      for (let idx = 0; idx < list.length; idx++) {
+        elemLowerCtx.vals = list.slice(idx, idx+1);
+        elemLowerCtx.storagePtr += elemLowerFn(elemLowerCtx);
+      }
+      
+      const bytesLowered = elemLowerCtx.storagePtr - ctx.storagePtr;
+      ctx.storagePtr = elemLowerCtx.storagePtr;
+      return bytesLowered;
+    }
+    
+    
+    if (ctx.vals.length !== 2) {
+      throw new Error('indirect parameter loading must have a pointer and length as vals');
+    }
+    let [valStartPtr, valLen] = ctx.vals;
+    const totalSizeBytes = valLen * size;
+    if (ctx.storageLen !== undefined && totalSizeBytes > ctx.storageLen) {
+      throw new Error('not enough storage remaining for list flat lower');
+    }
+    
+    const data = new Uint8Array(memory.buffer, valStartPtr, totalSizeBytes);
+    new Uint8Array(memory.buffer, storagePtr, totalSizeBytes).set(data);
+    
+    return totalSizeBytes;
+  }
+}
+
+function _lowerFlatTuple(size, memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatTuple()] args', { size, memory, vals, storagePtr, storageLen });
+  let [start, len] = vals;
+  if (storageLen !== undefined && len > storageLen) {
+    throw new Error('not enough storage remaining for tuple flat lower');
+  }
+  const data = new Uint8Array(memory.buffer, start, len);
+  new Uint8Array(memory.buffer, storagePtr, len).set(data);
+  return data.byteLength;
+}
+
+function _lowerFlatFlags(memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatFlags()] args', { size, memory, vals, storagePtr, storageLen });
+  if (vals.length !== 1) { throw new Error('unexpected number of core vals'); }
+  new DataView(memory.buffer).setInt32(storagePtr, vals[0], true);
+  return 4;
+}
+
+function _lowerFlatEnum(size, memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatEnum()] args', { size, memory, vals, storagePtr, storageLen });
+  let [start] = vals;
+  if (storageLen !== undefined && size !== undefined && size > storageLen) {
+    throw new Error('not enough storage remaining for enum flat lower');
+  }
+  const data = new Uint8Array(memory.buffer, start, size);
+  new Uint8Array(memory.buffer, storagePtr, size).set(data);
+  return data.byteLength;
+}
+
+function _lowerFlatOption(size, memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatOption()] args', { size, memory, vals, storagePtr, storageLen });
+  let [start] = vals;
+  if (storageLen !== undefined && size !== undefined && size > storageLen) {
+    throw new Error('not enough storage remaining for option flat lower');
+  }
+  const data = new Uint8Array(memory.buffer, start, size);
+  new Uint8Array(memory.buffer, storagePtr, size).set(data);
+  return data.byteLength;
+}
+
+function _lowerFlatResult(lowerMetas) {
+  const invalidTag = lowerMetas.find(t => t.tag !== 'ok' && t.tag !== 'error')
+  if (invalidTag) { throw new Error(`invalid variant tag [${invalidTag}] found for result`); }
+  
+  return function _lowerFlatResultInner() {
+    _debugLog('[_lowerFlatResult()] args', { lowerMetas });
+    let lowerFn = _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas }, { forResult: true });
+    return lowerFn.apply(null, arguments);
+  };
+}
+
+function _lowerFlatOwn(size, memory, vals, storagePtr, storageLen) {
+  _debugLog('[_lowerFlatOwn()] args', { size, memory, vals, storagePtr, storageLen });
+  throw new Error('flat lower for owned resources not yet implemented!');
 }
 const ASYNC_STATE = new Map();
 
@@ -1690,7 +2212,16 @@ class ComponentAsyncState {
   }
 }
 
+function clampGuest(i, min, max) {
+  if (i < min || i > max) throw new TypeError(`must be between ${min} and ${max}`);
+  return i;
+}
+
+const symbolCabiDispose = Symbol.for('cabiDispose');
+
 const symbolRscHandle = Symbol('handle');
+
+const symbolRscRep = Symbol.for('cabiRep');
 
 const symbolDispose = Symbol.dispose || Symbol.for('dispose');
 
@@ -1703,10 +2234,25 @@ function finalizationRegistryCreate (unregister) {
   return new FinalizationRegistry(unregister);
 }
 
+function getErrorPayload(e) {
+  if (e && hasOwnProperty.call(e, 'payload')) return e.payload;
+  if (e instanceof Error) throw e;
+  return e;
+}
+
+function throwInvalidBool() {
+  throw new TypeError('invalid variant discriminant for bool');
+}
+
+const hasOwnProperty = Object.prototype.hasOwnProperty;
+
 
 const module0 = getCoreModule('composed-js.core.wasm');
 const module1 = getCoreModule('composed-js.core2.wasm');
 const module2 = getCoreModule('composed-js.core3.wasm');
+const module3 = getCoreModule('composed-js.core4.wasm');
+const module4 = getCoreModule('composed-js.core5.wasm');
+const module5 = getCoreModule('composed-js.core6.wasm');
 
 const { onDone, onNumber } = imports['docs:calculator/stream-sink'];
 onDone._isHostProvided = true;
@@ -1725,6 +2271,318 @@ if (onNumber=== undefined) {
   throw err;
 }
 
+const { getArguments, getEnvironment, initialCwd } = imports['wasi:cli/environment'];
+getArguments._isHostProvided = true;
+
+if (getArguments=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getArguments', was 'getArguments' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+getEnvironment._isHostProvided = true;
+
+if (getEnvironment=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getEnvironment', was 'getEnvironment' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+initialCwd._isHostProvided = true;
+
+if (initialCwd=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'initialCwd', was 'initialCwd' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { exit } = imports['wasi:cli/exit'];
+exit._isHostProvided = true;
+
+if (exit=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'exit', was 'exit' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getStderr } = imports['wasi:cli/stderr'];
+getStderr._isHostProvided = true;
+
+if (getStderr=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getStderr', was 'getStderr' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getStdin } = imports['wasi:cli/stdin'];
+getStdin._isHostProvided = true;
+
+if (getStdin=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getStdin', was 'getStdin' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getStdout } = imports['wasi:cli/stdout'];
+getStdout._isHostProvided = true;
+
+if (getStdout=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getStdout', was 'getStdout' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { TerminalInput } = imports['wasi:cli/terminal-input'];
+TerminalInput._isHostProvided = true;
+
+if (TerminalInput=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'TerminalInput', was 'TerminalInput' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { TerminalOutput } = imports['wasi:cli/terminal-output'];
+TerminalOutput._isHostProvided = true;
+
+if (TerminalOutput=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'TerminalOutput', was 'TerminalOutput' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getTerminalStderr } = imports['wasi:cli/terminal-stderr'];
+getTerminalStderr._isHostProvided = true;
+
+if (getTerminalStderr=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getTerminalStderr', was 'getTerminalStderr' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getTerminalStdin } = imports['wasi:cli/terminal-stdin'];
+getTerminalStdin._isHostProvided = true;
+
+if (getTerminalStdin=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getTerminalStdin', was 'getTerminalStdin' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getTerminalStdout } = imports['wasi:cli/terminal-stdout'];
+getTerminalStdout._isHostProvided = true;
+
+if (getTerminalStdout=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getTerminalStdout', was 'getTerminalStdout' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { now, subscribeDuration, subscribeInstant } = imports['wasi:clocks/monotonic-clock'];
+now._isHostProvided = true;
+
+if (now=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'now', was 'now' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+subscribeDuration._isHostProvided = true;
+
+if (subscribeDuration=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'subscribeDuration', was 'subscribeDuration' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+subscribeInstant._isHostProvided = true;
+
+if (subscribeInstant=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'subscribeInstant', was 'subscribeInstant' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getDirectories } = imports['wasi:filesystem/preopens'];
+getDirectories._isHostProvided = true;
+
+if (getDirectories=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getDirectories', was 'getDirectories' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { Descriptor, DirectoryEntryStream, filesystemErrorCode } = imports['wasi:filesystem/types'];
+Descriptor._isHostProvided = true;
+
+if (Descriptor=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'Descriptor', was 'Descriptor' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+DirectoryEntryStream._isHostProvided = true;
+
+if (DirectoryEntryStream=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'DirectoryEntryStream', was 'DirectoryEntryStream' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+filesystemErrorCode._isHostProvided = true;
+
+if (filesystemErrorCode=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'filesystemErrorCode', was 'filesystemErrorCode' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { Error: Error$1 } = imports['wasi:io/error'];
+Error$1._isHostProvided = true;
+
+if (Error$1=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'Error$1', was 'Error' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { Pollable, poll } = imports['wasi:io/poll'];
+Pollable._isHostProvided = true;
+
+if (Pollable=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'Pollable', was 'Pollable' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+poll._isHostProvided = true;
+
+if (poll=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'poll', was 'poll' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { InputStream, OutputStream } = imports['wasi:io/streams'];
+InputStream._isHostProvided = true;
+
+if (InputStream=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'InputStream', was 'InputStream' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+OutputStream._isHostProvided = true;
+
+if (OutputStream=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'OutputStream', was 'OutputStream' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { getRandomBytes, getRandomU64 } = imports['wasi:random/random'];
+getRandomBytes._isHostProvided = true;
+
+if (getRandomBytes=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getRandomBytes', was 'getRandomBytes' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+getRandomU64._isHostProvided = true;
+
+if (getRandomU64=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'getRandomU64', was 'getRandomU64' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { instanceNetwork } = imports['wasi:sockets/instance-network'];
+instanceNetwork._isHostProvided = true;
+
+if (instanceNetwork=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'instanceNetwork', was 'instanceNetwork' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { ResolveAddressStream, resolveAddresses } = imports['wasi:sockets/ip-name-lookup'];
+ResolveAddressStream._isHostProvided = true;
+
+if (ResolveAddressStream=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'ResolveAddressStream', was 'ResolveAddressStream' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+resolveAddresses._isHostProvided = true;
+
+if (resolveAddresses=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'resolveAddresses', was 'resolveAddresses' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { Network } = imports['wasi:sockets/network'];
+Network._isHostProvided = true;
+
+if (Network=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'Network', was 'Network' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { TcpSocket } = imports['wasi:sockets/tcp'];
+TcpSocket._isHostProvided = true;
+
+if (TcpSocket=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'TcpSocket', was 'TcpSocket' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { createTcpSocket } = imports['wasi:sockets/tcp-create-socket'];
+createTcpSocket._isHostProvided = true;
+
+if (createTcpSocket=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'createTcpSocket', was 'createTcpSocket' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { IncomingDatagramStream, OutgoingDatagramStream, UdpSocket } = imports['wasi:sockets/udp'];
+IncomingDatagramStream._isHostProvided = true;
+
+if (IncomingDatagramStream=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'IncomingDatagramStream', was 'IncomingDatagramStream' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+OutgoingDatagramStream._isHostProvided = true;
+
+if (OutgoingDatagramStream=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'OutgoingDatagramStream', was 'OutgoingDatagramStream' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+UdpSocket._isHostProvided = true;
+
+if (UdpSocket=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'UdpSocket', was 'UdpSocket' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
+const { createUdpSocket } = imports['wasi:sockets/udp-create-socket'];
+createUdpSocket._isHostProvided = true;
+
+if (createUdpSocket=== undefined) {
+  const err = new Error("unexpectedly undefined instance import 'createUdpSocket', was 'createUdpSocket' available at instantiation?");
+  console.error("ERROR:", err.toString());
+  throw err;
+}
+
 let gen = (function* _initGenerator () {
   const instanceFlags1 = new WebAssembly.Global({ value: "i32", mutable: true }, 3);
   const instanceFlags3 = new WebAssembly.Global({ value: "i32", mutable: true }, 3);
@@ -1732,12 +2590,1517 @@ let gen = (function* _initGenerator () {
   let exports1;
   
   let lowered_import_0_metadata = {
+    qualifiedImportFn: 'wasi:io/poll@0.2.3#[method]pollable.block',
+    moduleIdx: null,
+  };
+  
+  const handleTable14 = [T_FLAG, 0];
+  const captureTable1= new Map();
+  let captureCnt1 = 0;
+  handleTables[14] = handleTable14;
+  
+  function trampoline4(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable14[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable1.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Pollable.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/poll@0.2.3", function="[method]pollable.block"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.block?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'block',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret; rsc0.block();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    _debugLog('[iface="wasi:io/poll@0.2.3", function="[method]pollable.block"][Instruction::Return]', {
+      funcName: '[method]pollable.block',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_1_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]input-stream.subscribe',
+    moduleIdx: null,
+  };
+  
+  const handleTable15 = [T_FLAG, 0];
+  const captureTable2= new Map();
+  let captureCnt2 = 0;
+  handleTables[15] = handleTable15;
+  
+  function trampoline5(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable15[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable2.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.subscribe"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.subscribe?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribe',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.subscribe();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle3 = ret[symbolRscHandle];
+    if (!handle3) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle3 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.subscribe"][Instruction::Return]', {
+      funcName: '[method]input-stream.subscribe',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle3;
+  }
+  
+  
+  let lowered_import_2_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.subscribe',
+    moduleIdx: null,
+  };
+  
+  const handleTable16 = [T_FLAG, 0];
+  const captureTable3= new Map();
+  let captureCnt3 = 0;
+  handleTables[16] = handleTable16;
+  
+  function trampoline6(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.subscribe"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.subscribe?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribe',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.subscribe();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle3 = ret[symbolRscHandle];
+    if (!handle3) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle3 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.subscribe"][Instruction::Return]', {
+      funcName: '[method]output-stream.subscribe',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle3;
+  }
+  
+  
+  let lowered_import_3_metadata = {
+    qualifiedImportFn: 'wasi:clocks/monotonic-clock@0.2.3#now',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline7() {
+    _debugLog('[iface="wasi:clocks/monotonic-clock@0.2.3", function="now"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = now?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'now',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  now();
+    endCurrentTask(3);
+    _debugLog('[iface="wasi:clocks/monotonic-clock@0.2.3", function="now"][Instruction::Return]', {
+      funcName: 'now',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return toUint64(ret);
+  }
+  
+  
+  let lowered_import_4_metadata = {
+    qualifiedImportFn: 'wasi:clocks/monotonic-clock@0.2.3#subscribe-instant',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline8(arg0) {
+    _debugLog('[iface="wasi:clocks/monotonic-clock@0.2.3", function="subscribe-instant"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = subscribeInstant?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribeInstant',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  subscribeInstant(BigInt.asUintN(64, arg0));
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle0 = ret[symbolRscHandle];
+    if (!handle0) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle0 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:clocks/monotonic-clock@0.2.3", function="subscribe-instant"][Instruction::Return]', {
+      funcName: 'subscribe-instant',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle0;
+  }
+  
+  
+  let lowered_import_5_metadata = {
+    qualifiedImportFn: 'wasi:clocks/monotonic-clock@0.2.3#subscribe-duration',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline9(arg0) {
+    _debugLog('[iface="wasi:clocks/monotonic-clock@0.2.3", function="subscribe-duration"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = subscribeDuration?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribeDuration',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  subscribeDuration(BigInt.asUintN(64, arg0));
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle0 = ret[symbolRscHandle];
+    if (!handle0) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle0 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:clocks/monotonic-clock@0.2.3", function="subscribe-duration"][Instruction::Return]', {
+      funcName: 'subscribe-duration',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle0;
+  }
+  
+  
+  let lowered_import_6_metadata = {
+    qualifiedImportFn: 'wasi:sockets/instance-network@0.2.3#instance-network',
+    moduleIdx: null,
+  };
+  
+  const handleTable18 = [T_FLAG, 0];
+  const captureTable8= new Map();
+  let captureCnt8 = 0;
+  handleTables[18] = handleTable18;
+  
+  function trampoline10() {
+    _debugLog('[iface="wasi:sockets/instance-network@0.2.3", function="instance-network"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = instanceNetwork?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'instanceNetwork',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  instanceNetwork();
+    endCurrentTask(3);
+    if (!(ret instanceof Network)) {
+      throw new TypeError('Resource error: Not a valid "Network" resource.');
+    }
+    var handle0 = ret[symbolRscHandle];
+    if (!handle0) {
+      const rep = ret[symbolRscRep] || ++captureCnt8;
+      captureTable8.set(rep, ret);
+      handle0 = rscTableCreateOwn(handleTable18, rep);
+    }
+    _debugLog('[iface="wasi:sockets/instance-network@0.2.3", function="instance-network"][Instruction::Return]', {
+      funcName: 'instance-network',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle0;
+  }
+  
+  
+  let lowered_import_7_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.subscribe',
+    moduleIdx: null,
+  };
+  
+  const handleTable17 = [T_FLAG, 0];
+  const captureTable12= new Map();
+  let captureCnt12 = 0;
+  handleTables[17] = handleTable17;
+  
+  function trampoline11(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.subscribe"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.subscribe?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribe',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.subscribe();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle3 = ret[symbolRscHandle];
+    if (!handle3) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle3 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.subscribe"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.subscribe',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle3;
+  }
+  
+  
+  let lowered_import_8_metadata = {
+    qualifiedImportFn: 'wasi:random/random@0.2.3#get-random-u64',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline12() {
+    _debugLog('[iface="wasi:random/random@0.2.3", function="get-random-u64"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getRandomU64?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getRandomU64',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getRandomU64();
+    endCurrentTask(3);
+    _debugLog('[iface="wasi:random/random@0.2.3", function="get-random-u64"][Instruction::Return]', {
+      funcName: 'get-random-u64',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return toUint64(ret);
+  }
+  
+  
+  let lowered_import_9_metadata = {
+    qualifiedImportFn: 'wasi:cli/exit@0.2.3#exit',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline13(arg0) {
+    let variant0;
+    switch (arg0) {
+      case 0: {
+        variant0= {
+          tag: 'ok',
+          val: undefined
+        };
+        break;
+      }
+      case 1: {
+        variant0= {
+          tag: 'err',
+          val: undefined
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for expected');
+      }
+    }
+    _debugLog('[iface="wasi:cli/exit@0.2.3", function="exit"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = exit?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'exit',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret; exit(variant0);
+    endCurrentTask(3);
+    _debugLog('[iface="wasi:cli/exit@0.2.3", function="exit"][Instruction::Return]', {
+      funcName: 'exit',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_10_metadata = {
+    qualifiedImportFn: 'wasi:io/poll@0.2.3#[method]pollable.ready',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline14(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable14[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable1.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Pollable.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/poll@0.2.3", function="[method]pollable.ready"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.ready?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'ready',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.ready();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    _debugLog('[iface="wasi:io/poll@0.2.3", function="[method]pollable.ready"][Instruction::Return]', {
+      funcName: '[method]pollable.ready',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return ret ? 1 : 0;
+  }
+  
+  
+  let lowered_import_11_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.is-same-object',
+    moduleIdx: null,
+  };
+  
+  const handleTable20 = [T_FLAG, 0];
+  const captureTable6= new Map();
+  let captureCnt6 = 0;
+  handleTables[20] = handleTable20;
+  
+  function trampoline15(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var handle4 = arg1;
+    var rep5 = handleTable20[(handle4 << 1) + 1] & ~T_FLAG;
+    var rsc3 = captureTable6.get(rep5);
+    if (!rsc3) {
+      rsc3 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc3, symbolRscHandle, { writable: true, value: handle4});
+      Object.defineProperty(rsc3, symbolRscRep, { writable: true, value: rep5});
+    }
+    curResourceBorrows.push(rsc3);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.is-same-object"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.isSameObject?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'isSameObject',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.isSameObject(rsc3);
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.is-same-object"][Instruction::Return]', {
+      funcName: '[method]descriptor.is-same-object',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return ret ? 1 : 0;
+  }
+  
+  
+  let lowered_import_12_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.address-family',
+    moduleIdx: null,
+  };
+  
+  const handleTable22 = [T_FLAG, 0];
+  const captureTable9= new Map();
+  let captureCnt9 = 0;
+  handleTables[22] = handleTable22;
+  
+  function trampoline16(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.address-family"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.addressFamily?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'addressFamily',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.addressFamily();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var val3 = ret;
+    let enum3;
+    switch (val3) {
+      case 'ipv4': {
+        enum3 = 0;
+        break;
+      }
+      case 'ipv6': {
+        enum3 = 1;
+        break;
+      }
+      default: {
+        if ((ret) instanceof Error) {
+          console.error(ret);
+        }
+        
+        throw new TypeError(`"${val3}" is not one of the cases of ip-address-family`);
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.address-family"][Instruction::Return]', {
+      funcName: '[method]udp-socket.address-family',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return enum3;
+  }
+  
+  
+  let lowered_import_13_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.subscribe',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline17(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.subscribe"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.subscribe?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribe',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.subscribe();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle3 = ret[symbolRscHandle];
+    if (!handle3) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle3 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.subscribe"][Instruction::Return]', {
+      funcName: '[method]udp-socket.subscribe',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle3;
+  }
+  
+  
+  let lowered_import_14_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]incoming-datagram-stream.subscribe',
+    moduleIdx: null,
+  };
+  
+  const handleTable23 = [T_FLAG, 0];
+  const captureTable10= new Map();
+  let captureCnt10 = 0;
+  handleTables[23] = handleTable23;
+  
+  function trampoline18(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable23[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable10.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(IncomingDatagramStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]incoming-datagram-stream.subscribe"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.subscribe?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribe',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.subscribe();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle3 = ret[symbolRscHandle];
+    if (!handle3) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle3 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]incoming-datagram-stream.subscribe"][Instruction::Return]', {
+      funcName: '[method]incoming-datagram-stream.subscribe',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle3;
+  }
+  
+  
+  let lowered_import_15_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]outgoing-datagram-stream.subscribe',
+    moduleIdx: null,
+  };
+  
+  const handleTable24 = [T_FLAG, 0];
+  const captureTable11= new Map();
+  let captureCnt11 = 0;
+  handleTables[24] = handleTable24;
+  
+  function trampoline19(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable24[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable11.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutgoingDatagramStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]outgoing-datagram-stream.subscribe"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.subscribe?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribe',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.subscribe();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle3 = ret[symbolRscHandle];
+    if (!handle3) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle3 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]outgoing-datagram-stream.subscribe"][Instruction::Return]', {
+      funcName: '[method]outgoing-datagram-stream.subscribe',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle3;
+  }
+  
+  
+  let lowered_import_16_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.is-listening',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline20(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.is-listening"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.isListening?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'isListening',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.isListening();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.is-listening"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.is-listening',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return ret ? 1 : 0;
+  }
+  
+  
+  let lowered_import_17_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.address-family',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline21(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.address-family"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.addressFamily?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'addressFamily',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.addressFamily();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var val3 = ret;
+    let enum3;
+    switch (val3) {
+      case 'ipv4': {
+        enum3 = 0;
+        break;
+      }
+      case 'ipv6': {
+        enum3 = 1;
+        break;
+      }
+      default: {
+        if ((ret) instanceof Error) {
+          console.error(ret);
+        }
+        
+        throw new TypeError(`"${val3}" is not one of the cases of ip-address-family`);
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.address-family"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.address-family',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return enum3;
+  }
+  
+  
+  let lowered_import_18_metadata = {
+    qualifiedImportFn: 'wasi:sockets/ip-name-lookup@0.2.3#[method]resolve-address-stream.subscribe',
+    moduleIdx: null,
+  };
+  
+  const handleTable25 = [T_FLAG, 0];
+  const captureTable13= new Map();
+  let captureCnt13 = 0;
+  handleTables[25] = handleTable25;
+  
+  function trampoline22(arg0) {
+    var handle1 = arg0;
+    var rep2 = handleTable25[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable13.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(ResolveAddressStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/ip-name-lookup@0.2.3", function="[method]resolve-address-stream.subscribe"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.subscribe?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'subscribe',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.subscribe();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    if (!(ret instanceof Pollable)) {
+      throw new TypeError('Resource error: Not a valid "Pollable" resource.');
+    }
+    var handle3 = ret[symbolRscHandle];
+    if (!handle3) {
+      const rep = ret[symbolRscRep] || ++captureCnt1;
+      captureTable1.set(rep, ret);
+      handle3 = rscTableCreateOwn(handleTable14, rep);
+    }
+    _debugLog('[iface="wasi:sockets/ip-name-lookup@0.2.3", function="[method]resolve-address-stream.subscribe"][Instruction::Return]', {
+      funcName: '[method]resolve-address-stream.subscribe',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle3;
+  }
+  
+  let exports2;
+  
+  let lowered_import_19_metadata = {
     qualifiedImportFn: 'docs:calculator/stream-sink@0.1.0#on-number',
     moduleIdx: null,
   };
   
   
-  function trampoline0(arg0) {
+  function trampoline23(arg0) {
     _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-number"] [Instruction::CallInterface] (sync, @ enter)');
     let hostProvided = false;
     hostProvided = onNumber?._isHostProvided;
@@ -1791,13 +4154,13 @@ let gen = (function* _initGenerator () {
   }
   
   
-  let lowered_import_1_metadata = {
+  let lowered_import_20_metadata = {
     qualifiedImportFn: 'docs:calculator/stream-sink@0.1.0#on-done',
     moduleIdx: null,
   };
   
   
-  function trampoline1() {
+  function trampoline24() {
     _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-done"] [Instruction::CallInterface] (sync, @ enter)');
     let hostProvided = false;
     hostProvided = onDone?._isHostProvided;
@@ -1849,11 +4212,20060 @@ let gen = (function* _initGenerator () {
     });
   }
   
-  let exports2;
+  let exports3;
+  
+  let lowered_import_21_metadata = {
+    qualifiedImportFn: 'wasi:cli/stderr@0.2.3#get-stderr',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline41() {
+    _debugLog('[iface="wasi:cli/stderr@0.2.3", function="get-stderr"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getStderr?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getStderr',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getStderr();
+    endCurrentTask(3);
+    if (!(ret instanceof OutputStream)) {
+      throw new TypeError('Resource error: Not a valid "OutputStream" resource.');
+    }
+    var handle0 = ret[symbolRscHandle];
+    if (!handle0) {
+      const rep = ret[symbolRscRep] || ++captureCnt3;
+      captureTable3.set(rep, ret);
+      handle0 = rscTableCreateOwn(handleTable16, rep);
+    }
+    _debugLog('[iface="wasi:cli/stderr@0.2.3", function="get-stderr"][Instruction::Return]', {
+      funcName: 'get-stderr',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle0;
+  }
+  
+  
+  let lowered_import_22_metadata = {
+    qualifiedImportFn: 'wasi:cli/stdin@0.2.3#get-stdin',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline42() {
+    _debugLog('[iface="wasi:cli/stdin@0.2.3", function="get-stdin"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getStdin?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getStdin',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getStdin();
+    endCurrentTask(3);
+    if (!(ret instanceof InputStream)) {
+      throw new TypeError('Resource error: Not a valid "InputStream" resource.');
+    }
+    var handle0 = ret[symbolRscHandle];
+    if (!handle0) {
+      const rep = ret[symbolRscRep] || ++captureCnt2;
+      captureTable2.set(rep, ret);
+      handle0 = rscTableCreateOwn(handleTable15, rep);
+    }
+    _debugLog('[iface="wasi:cli/stdin@0.2.3", function="get-stdin"][Instruction::Return]', {
+      funcName: 'get-stdin',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle0;
+  }
+  
+  
+  let lowered_import_23_metadata = {
+    qualifiedImportFn: 'wasi:cli/stdout@0.2.3#get-stdout',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline43() {
+    _debugLog('[iface="wasi:cli/stdout@0.2.3", function="get-stdout"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getStdout?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getStdout',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getStdout();
+    endCurrentTask(3);
+    if (!(ret instanceof OutputStream)) {
+      throw new TypeError('Resource error: Not a valid "OutputStream" resource.');
+    }
+    var handle0 = ret[symbolRscHandle];
+    if (!handle0) {
+      const rep = ret[symbolRscRep] || ++captureCnt3;
+      captureTable3.set(rep, ret);
+      handle0 = rscTableCreateOwn(handleTable16, rep);
+    }
+    _debugLog('[iface="wasi:cli/stdout@0.2.3", function="get-stdout"][Instruction::Return]', {
+      funcName: 'get-stdout',
+      paramCount: 1,
+      async: false,
+      postReturn: false
+    });
+    return handle0;
+  }
+  
+  let exports4;
+  let memory0;
+  let realloc0;
+  let realloc1;
+  
+  let lowered_import_24_metadata = {
+    qualifiedImportFn: 'wasi:io/poll@0.2.3#poll',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline44(arg0, arg1, arg2) {
+    var len3 = arg1;
+    var base3 = arg0;
+    var result3 = [];
+    for (let i = 0; i < len3; i++) {
+      const base = base3 + i * 4;
+      var handle1 = dataView(memory0).getInt32(base + 0, true);
+      var rep2 = handleTable14[(handle1 << 1) + 1] & ~T_FLAG;
+      var rsc0 = captureTable1.get(rep2);
+      if (!rsc0) {
+        rsc0 = Object.create(Pollable.prototype);
+        Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+        Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+      }
+      curResourceBorrows.push(rsc0);
+      result3.push(rsc0);
+    }
+    _debugLog('[iface="wasi:io/poll@0.2.3", function="poll"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = poll?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'poll',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  poll(result3);
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var val4 = ret;
+    var len4 = val4.length;
+    var ptr4 = realloc0(0, 0, 4, len4 * 4);
+    
+    let valData4;
+    const valLenBytes4 = len4 * 4;
+    if (Array.isArray(val4)) {
+      // Regular array likely containing numbers, write values to memory
+      let offset = 0;
+      const dv4 = new DataView(memory0.buffer);
+      for (const v of val4) {
+        dv4.setUint32(ptr4+ offset, v, true);
+        offset += 4;
+      }
+    } else {
+      // TypedArray / ArrayBuffer-like, direct copy
+      valData4 = new Uint8Array(val4.buffer || val4, val4.byteOffset, valLenBytes4);
+      const out4 = new Uint8Array(memory0.buffer, ptr4,valLenBytes4);
+      out4.set(valData4);
+    }
+    
+    dataView(memory0).setUint32(arg2 + 4, len4, true);
+    dataView(memory0).setUint32(arg2 + 0, ptr4, true);
+    _debugLog('[iface="wasi:io/poll@0.2.3", function="poll"][Instruction::Return]', {
+      funcName: 'poll',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_25_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]input-stream.read',
+    moduleIdx: null,
+  };
+  
+  const handleTable19 = [T_FLAG, 0];
+  const captureTable0= new Map();
+  let captureCnt0 = 0;
+  handleTables[19] = handleTable19;
+  
+  function trampoline45(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable15[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable2.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.read"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.read?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'read',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.read(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        var val3 = e;
+        var len3 = val3.byteLength;
+        var ptr3 = realloc0(0, 0, 1, len3 * 1);
+        
+        let valData3;
+        const valLenBytes3 = len3 * 1;
+        if (Array.isArray(val3)) {
+          // Regular array likely containing numbers, write values to memory
+          let offset = 0;
+          const dv3 = new DataView(memory0.buffer);
+          for (const v of val3) {
+            dv3.setUint8(ptr3+ offset, v, true);
+            offset += 1;
+          }
+        } else {
+          // TypedArray / ArrayBuffer-like, direct copy
+          valData3 = new Uint8Array(val3.buffer || val3, val3.byteOffset, valLenBytes3);
+          const out3 = new Uint8Array(memory0.buffer, ptr3,valLenBytes3);
+          out3.set(valData3);
+        }
+        
+        dataView(memory0).setUint32(arg2 + 8, len3, true);
+        dataView(memory0).setUint32(arg2 + 4, ptr3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant5 = e;
+        switch (variant5.tag) {
+          case 'last-operation-failed': {
+            const e = variant5.val;
+            dataView(memory0).setInt8(arg2 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle4 = e[symbolRscHandle];
+            if (!handle4) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle4 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 8, handle4, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant5.tag)}\` (received \`${variant5}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.read"][Instruction::Return]', {
+      funcName: '[method]input-stream.read',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_26_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]input-stream.blocking-read',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline46(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable15[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable2.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.blocking-read"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.blockingRead?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'blockingRead',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.blockingRead(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        var val3 = e;
+        var len3 = val3.byteLength;
+        var ptr3 = realloc0(0, 0, 1, len3 * 1);
+        
+        let valData3;
+        const valLenBytes3 = len3 * 1;
+        if (Array.isArray(val3)) {
+          // Regular array likely containing numbers, write values to memory
+          let offset = 0;
+          const dv3 = new DataView(memory0.buffer);
+          for (const v of val3) {
+            dv3.setUint8(ptr3+ offset, v, true);
+            offset += 1;
+          }
+        } else {
+          // TypedArray / ArrayBuffer-like, direct copy
+          valData3 = new Uint8Array(val3.buffer || val3, val3.byteOffset, valLenBytes3);
+          const out3 = new Uint8Array(memory0.buffer, ptr3,valLenBytes3);
+          out3.set(valData3);
+        }
+        
+        dataView(memory0).setUint32(arg2 + 8, len3, true);
+        dataView(memory0).setUint32(arg2 + 4, ptr3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant5 = e;
+        switch (variant5.tag) {
+          case 'last-operation-failed': {
+            const e = variant5.val;
+            dataView(memory0).setInt8(arg2 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle4 = e[symbolRscHandle];
+            if (!handle4) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle4 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 8, handle4, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant5.tag)}\` (received \`${variant5}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.blocking-read"][Instruction::Return]', {
+      funcName: '[method]input-stream.blocking-read',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_27_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.check-write',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline47(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.check-write"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.checkWrite?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'checkWrite',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.checkWrite()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var variant4 = e;
+        switch (variant4.tag) {
+          case 'last-operation-failed': {
+            const e = variant4.val;
+            dataView(memory0).setInt8(arg1 + 8, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle3 = e[symbolRscHandle];
+            if (!handle3) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle3 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg1 + 12, handle3, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg1 + 8, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant4.tag)}\` (received \`${variant4}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.check-write"][Instruction::Return]', {
+      funcName: '[method]output-stream.check-write',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_28_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.write',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline48(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = new Uint8Array(memory0.buffer.slice(ptr3, ptr3 + len3 * 1));
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.write"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.write?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'write',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.write(result3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var variant5 = e;
+        switch (variant5.tag) {
+          case 'last-operation-failed': {
+            const e = variant5.val;
+            dataView(memory0).setInt8(arg3 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle4 = e[symbolRscHandle];
+            if (!handle4) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle4 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg3 + 8, handle4, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg3 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant5.tag)}\` (received \`${variant5}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.write"][Instruction::Return]', {
+      funcName: '[method]output-stream.write',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_29_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.blocking-flush',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline49(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-flush"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.blockingFlush?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'blockingFlush',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.blockingFlush()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var variant4 = e;
+        switch (variant4.tag) {
+          case 'last-operation-failed': {
+            const e = variant4.val;
+            dataView(memory0).setInt8(arg1 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle3 = e[symbolRscHandle];
+            if (!handle3) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle3 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg1 + 8, handle3, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg1 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant4.tag)}\` (received \`${variant4}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-flush"][Instruction::Return]', {
+      funcName: '[method]output-stream.blocking-flush',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_30_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.start-connect',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline50(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13, arg14) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var handle4 = arg1;
+    var rep5 = handleTable18[(handle4 << 1) + 1] & ~T_FLAG;
+    var rsc3 = captureTable8.get(rep5);
+    if (!rsc3) {
+      rsc3 = Object.create(Network.prototype);
+      Object.defineProperty(rsc3, symbolRscHandle, { writable: true, value: handle4});
+      Object.defineProperty(rsc3, symbolRscRep, { writable: true, value: rep5});
+    }
+    curResourceBorrows.push(rsc3);
+    let variant6;
+    switch (arg2) {
+      case 0: {
+        variant6= {
+          tag: 'ipv4',
+          val: {
+            port: clampGuest(arg3, 0, 65535),
+            address: [clampGuest(arg4, 0, 255), clampGuest(arg5, 0, 255), clampGuest(arg6, 0, 255), clampGuest(arg7, 0, 255)],
+          }
+        };
+        break;
+      }
+      case 1: {
+        variant6= {
+          tag: 'ipv6',
+          val: {
+            port: clampGuest(arg3, 0, 65535),
+            flowInfo: arg4 >>> 0,
+            address: [clampGuest(arg5, 0, 65535), clampGuest(arg6, 0, 65535), clampGuest(arg7, 0, 65535), clampGuest(arg8, 0, 65535), clampGuest(arg9, 0, 65535), clampGuest(arg10, 0, 65535), clampGuest(arg11, 0, 65535), clampGuest(arg12, 0, 65535)],
+            scopeId: arg13 >>> 0,
+          }
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for IpSocketAddress');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.start-connect"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.startConnect?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'startConnect',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.startConnect(rsc3, variant6)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg14 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg14 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'unknown': {
+            enum7 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum7 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum7 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum7 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum7 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum7 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum7 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum7 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum7 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum7 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum7 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum7 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum7 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum7 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum7 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum7 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum7 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum7 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum7 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg14 + 1, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.start-connect"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.start-connect',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_31_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.finish-connect',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline51(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.finish-connect"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.finishConnect?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'finishConnect',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.finishConnect()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant7 = ret;
+    switch (variant7.tag) {
+      case 'ok': {
+        const e = variant7.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var [tuple3_0, tuple3_1] = e;
+        if (!(tuple3_0 instanceof InputStream)) {
+          throw new TypeError('Resource error: Not a valid "InputStream" resource.');
+        }
+        var handle4 = tuple3_0[symbolRscHandle];
+        if (!handle4) {
+          const rep = tuple3_0[symbolRscRep] || ++captureCnt2;
+          captureTable2.set(rep, tuple3_0);
+          handle4 = rscTableCreateOwn(handleTable15, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 4, handle4, true);
+        if (!(tuple3_1 instanceof OutputStream)) {
+          throw new TypeError('Resource error: Not a valid "OutputStream" resource.');
+        }
+        var handle5 = tuple3_1[symbolRscHandle];
+        if (!handle5) {
+          const rep = tuple3_1[symbolRscRep] || ++captureCnt3;
+          captureTable3.set(rep, tuple3_1);
+          handle5 = rscTableCreateOwn(handleTable16, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 8, handle5, true);
+        break;
+      }
+      case 'err': {
+        const e = variant7.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val6 = e;
+        let enum6;
+        switch (val6) {
+          case 'unknown': {
+            enum6 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum6 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum6 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum6 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum6 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum6 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum6 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum6 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum6 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum6 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum6 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum6 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum6 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum6 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum6 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum6 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum6 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum6 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum6 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum6 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum6 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val6}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum6, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.finish-connect"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.finish-connect',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_32_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.shutdown',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline52(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    let enum3;
+    switch (arg1) {
+      case 0: {
+        enum3 = 'receive';
+        break;
+      }
+      case 1: {
+        enum3 = 'send';
+        break;
+      }
+      case 2: {
+        enum3 = 'both';
+        break;
+      }
+      default: {
+        throw new TypeError('invalid discriminant specified for ShutdownType');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.shutdown"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.shutdown?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'shutdown',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.shutdown(enum3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'unknown': {
+            enum4 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum4 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum4 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum4 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum4 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum4 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum4 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum4 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum4 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum4 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum4 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum4 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum4 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum4 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum4 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum4 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum4 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum4 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum4 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.shutdown"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.shutdown',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_33_metadata = {
+    qualifiedImportFn: 'wasi:cli/environment@0.2.3#get-arguments',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline53(arg0) {
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-arguments"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getArguments?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getArguments',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getArguments();
+    endCurrentTask(3);
+    var vec1 = ret;
+    var len1 = vec1.length;
+    var result1 = realloc0(0, 0, 4, len1 * 8);
+    for (let i = 0; i < vec1.length; i++) {
+      const e = vec1[i];
+      const base = result1 + i * 8;
+      var encodeRes = _utf8AllocateAndEncode(e, realloc0, memory0);
+      var ptr0= encodeRes.ptr;
+      var len0 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 4, len0, true);
+      dataView(memory0).setUint32(base + 0, ptr0, true);
+    }
+    dataView(memory0).setUint32(arg0 + 4, len1, true);
+    dataView(memory0).setUint32(arg0 + 0, result1, true);
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-arguments"][Instruction::Return]', {
+      funcName: 'get-arguments',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_34_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp-create-socket@0.2.3#create-tcp-socket',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline54(arg0, arg1) {
+    let enum0;
+    switch (arg0) {
+      case 0: {
+        enum0 = 'ipv4';
+        break;
+      }
+      case 1: {
+        enum0 = 'ipv6';
+        break;
+      }
+      default: {
+        throw new TypeError('invalid discriminant specified for IpAddressFamily');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp-create-socket@0.2.3", function="create-tcp-socket"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = createTcpSocket?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'createTcpSocket',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  createTcpSocket(enum0)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    endCurrentTask(3);
+    var variant3 = ret;
+    switch (variant3.tag) {
+      case 'ok': {
+        const e = variant3.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        if (!(e instanceof TcpSocket)) {
+          throw new TypeError('Resource error: Not a valid "TcpSocket" resource.');
+        }
+        var handle1 = e[symbolRscHandle];
+        if (!handle1) {
+          const rep = e[symbolRscRep] || ++captureCnt12;
+          captureTable12.set(rep, e);
+          handle1 = rscTableCreateOwn(handleTable17, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 4, handle1, true);
+        break;
+      }
+      case 'err': {
+        const e = variant3.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val2 = e;
+        let enum2;
+        switch (val2) {
+          case 'unknown': {
+            enum2 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum2 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum2 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum2 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum2 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum2 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum2 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum2 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum2 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum2 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum2 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum2 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum2 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum2 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum2 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum2 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum2 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum2 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum2 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum2 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum2 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val2}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum2, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp-create-socket@0.2.3", function="create-tcp-socket"][Instruction::Return]', {
+      funcName: 'create-tcp-socket',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_35_metadata = {
+    qualifiedImportFn: 'wasi:random/random@0.2.3#get-random-bytes',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline55(arg0, arg1) {
+    _debugLog('[iface="wasi:random/random@0.2.3", function="get-random-bytes"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getRandomBytes?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getRandomBytes',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getRandomBytes(BigInt.asUintN(64, arg0));
+    endCurrentTask(3);
+    var val0 = ret;
+    var len0 = val0.byteLength;
+    var ptr0 = realloc0(0, 0, 1, len0 * 1);
+    
+    let valData0;
+    const valLenBytes0 = len0 * 1;
+    if (Array.isArray(val0)) {
+      // Regular array likely containing numbers, write values to memory
+      let offset = 0;
+      const dv0 = new DataView(memory0.buffer);
+      for (const v of val0) {
+        dv0.setUint8(ptr0+ offset, v, true);
+        offset += 1;
+      }
+    } else {
+      // TypedArray / ArrayBuffer-like, direct copy
+      valData0 = new Uint8Array(val0.buffer || val0, val0.byteOffset, valLenBytes0);
+      const out0 = new Uint8Array(memory0.buffer, ptr0,valLenBytes0);
+      out0.set(valData0);
+    }
+    
+    dataView(memory0).setUint32(arg1 + 4, len0, true);
+    dataView(memory0).setUint32(arg1 + 0, ptr0, true);
+    _debugLog('[iface="wasi:random/random@0.2.3", function="get-random-bytes"][Instruction::Return]', {
+      funcName: 'get-random-bytes',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_36_metadata = {
+    qualifiedImportFn: 'wasi:cli/environment@0.2.3#get-environment',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline56(arg0) {
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-environment"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getEnvironment?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getEnvironment',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getEnvironment();
+    endCurrentTask(3);
+    var vec3 = ret;
+    var len3 = vec3.length;
+    var result3 = realloc0(0, 0, 4, len3 * 16);
+    for (let i = 0; i < vec3.length; i++) {
+      const e = vec3[i];
+      const base = result3 + i * 16;var [tuple0_0, tuple0_1] = e;
+      
+      var encodeRes = _utf8AllocateAndEncode(tuple0_0, realloc0, memory0);
+      var ptr1= encodeRes.ptr;
+      var len1 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 4, len1, true);
+      dataView(memory0).setUint32(base + 0, ptr1, true);
+      
+      var encodeRes = _utf8AllocateAndEncode(tuple0_1, realloc0, memory0);
+      var ptr2= encodeRes.ptr;
+      var len2 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 12, len2, true);
+      dataView(memory0).setUint32(base + 8, ptr2, true);
+    }
+    dataView(memory0).setUint32(arg0 + 4, len3, true);
+    dataView(memory0).setUint32(arg0 + 0, result3, true);
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-environment"][Instruction::Return]', {
+      funcName: 'get-environment',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_37_metadata = {
+    qualifiedImportFn: 'wasi:cli/environment@0.2.3#initial-cwd',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline57(arg0) {
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="initial-cwd"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = initialCwd?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'initialCwd',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  initialCwd();
+    endCurrentTask(3);
+    var variant1 = ret;
+    if (variant1 === null || variant1=== undefined) {
+      dataView(memory0).setInt8(arg0 + 0, 0, true);
+    } else {
+      const e = variant1;
+      dataView(memory0).setInt8(arg0 + 0, 1, true);
+      
+      var encodeRes = _utf8AllocateAndEncode(e, realloc0, memory0);
+      var ptr0= encodeRes.ptr;
+      var len0 = encodeRes.len;
+      
+      dataView(memory0).setUint32(arg0 + 8, len0, true);
+      dataView(memory0).setUint32(arg0 + 4, ptr0, true);
+    }
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="initial-cwd"][Instruction::Return]', {
+      funcName: 'initial-cwd',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_38_metadata = {
+    qualifiedImportFn: 'wasi:io/error@0.2.3#[method]error.to-debug-string',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline58(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable19[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable0.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Error$1.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/error@0.2.3", function="[method]error.to-debug-string"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.toDebugString?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'toDebugString',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  rsc0.toDebugString();
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    
+    var encodeRes = _utf8AllocateAndEncode(ret, realloc0, memory0);
+    var ptr3= encodeRes.ptr;
+    var len3 = encodeRes.len;
+    
+    dataView(memory0).setUint32(arg1 + 4, len3, true);
+    dataView(memory0).setUint32(arg1 + 0, ptr3, true);
+    _debugLog('[iface="wasi:io/error@0.2.3", function="[method]error.to-debug-string"][Instruction::Return]', {
+      funcName: '[method]error.to-debug-string',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_39_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]input-stream.skip',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline59(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable15[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable2.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.skip"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.skip?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'skip',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.skip(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg2 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant4 = e;
+        switch (variant4.tag) {
+          case 'last-operation-failed': {
+            const e = variant4.val;
+            dataView(memory0).setInt8(arg2 + 8, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle3 = e[symbolRscHandle];
+            if (!handle3) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle3 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 12, handle3, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 8, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant4.tag)}\` (received \`${variant4}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.skip"][Instruction::Return]', {
+      funcName: '[method]input-stream.skip',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_40_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]input-stream.blocking-skip',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline60(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable15[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable2.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.blocking-skip"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.blockingSkip?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'blockingSkip',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.blockingSkip(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg2 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant4 = e;
+        switch (variant4.tag) {
+          case 'last-operation-failed': {
+            const e = variant4.val;
+            dataView(memory0).setInt8(arg2 + 8, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle3 = e[symbolRscHandle];
+            if (!handle3) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle3 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 12, handle3, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 8, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant4.tag)}\` (received \`${variant4}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.blocking-skip"][Instruction::Return]', {
+      funcName: '[method]input-stream.blocking-skip',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_41_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.blocking-write-and-flush',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline61(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = new Uint8Array(memory0.buffer.slice(ptr3, ptr3 + len3 * 1));
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-write-and-flush"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.blockingWriteAndFlush?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'blockingWriteAndFlush',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.blockingWriteAndFlush(result3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var variant5 = e;
+        switch (variant5.tag) {
+          case 'last-operation-failed': {
+            const e = variant5.val;
+            dataView(memory0).setInt8(arg3 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle4 = e[symbolRscHandle];
+            if (!handle4) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle4 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg3 + 8, handle4, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg3 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant5.tag)}\` (received \`${variant5}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-write-and-flush"][Instruction::Return]', {
+      funcName: '[method]output-stream.blocking-write-and-flush',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_42_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.flush',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline62(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.flush"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.flush?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'flush',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.flush()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var variant4 = e;
+        switch (variant4.tag) {
+          case 'last-operation-failed': {
+            const e = variant4.val;
+            dataView(memory0).setInt8(arg1 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle3 = e[symbolRscHandle];
+            if (!handle3) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle3 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg1 + 8, handle3, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg1 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant4.tag)}\` (received \`${variant4}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.flush"][Instruction::Return]', {
+      funcName: '[method]output-stream.flush',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_43_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.write-zeroes',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline63(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.write-zeroes"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.writeZeroes?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'writeZeroes',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.writeZeroes(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant4 = e;
+        switch (variant4.tag) {
+          case 'last-operation-failed': {
+            const e = variant4.val;
+            dataView(memory0).setInt8(arg2 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle3 = e[symbolRscHandle];
+            if (!handle3) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle3 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 8, handle3, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant4.tag)}\` (received \`${variant4}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.write-zeroes"][Instruction::Return]', {
+      funcName: '[method]output-stream.write-zeroes',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_44_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.blocking-write-zeroes-and-flush',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline64(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-write-zeroes-and-flush"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.blockingWriteZeroesAndFlush?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'blockingWriteZeroesAndFlush',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.blockingWriteZeroesAndFlush(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant4 = e;
+        switch (variant4.tag) {
+          case 'last-operation-failed': {
+            const e = variant4.val;
+            dataView(memory0).setInt8(arg2 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle3 = e[symbolRscHandle];
+            if (!handle3) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle3 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 8, handle3, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant4.tag)}\` (received \`${variant4}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-write-zeroes-and-flush"][Instruction::Return]', {
+      funcName: '[method]output-stream.blocking-write-zeroes-and-flush',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_45_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.splice',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline65(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var handle4 = arg1;
+    var rep5 = handleTable15[(handle4 << 1) + 1] & ~T_FLAG;
+    var rsc3 = captureTable2.get(rep5);
+    if (!rsc3) {
+      rsc3 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc3, symbolRscHandle, { writable: true, value: handle4});
+      Object.defineProperty(rsc3, symbolRscRep, { writable: true, value: rep5});
+    }
+    curResourceBorrows.push(rsc3);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.splice"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.splice?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'splice',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.splice(rsc3, BigInt.asUintN(64, arg2))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg3 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var variant7 = e;
+        switch (variant7.tag) {
+          case 'last-operation-failed': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg3 + 8, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle6 = e[symbolRscHandle];
+            if (!handle6) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle6 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg3 + 12, handle6, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg3 + 8, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant7.tag)}\` (received \`${variant7}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.splice"][Instruction::Return]', {
+      funcName: '[method]output-stream.splice',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_46_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]output-stream.blocking-splice',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline66(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable16[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable3.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var handle4 = arg1;
+    var rep5 = handleTable15[(handle4 << 1) + 1] & ~T_FLAG;
+    var rsc3 = captureTable2.get(rep5);
+    if (!rsc3) {
+      rsc3 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc3, symbolRscHandle, { writable: true, value: handle4});
+      Object.defineProperty(rsc3, symbolRscRep, { writable: true, value: rep5});
+    }
+    curResourceBorrows.push(rsc3);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-splice"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.blockingSplice?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'blockingSplice',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.blockingSplice(rsc3, BigInt.asUintN(64, arg2))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg3 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var variant7 = e;
+        switch (variant7.tag) {
+          case 'last-operation-failed': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg3 + 8, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle6 = e[symbolRscHandle];
+            if (!handle6) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle6 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg3 + 12, handle6, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg3 + 8, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant7.tag)}\` (received \`${variant7}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]output-stream.blocking-splice"][Instruction::Return]', {
+      funcName: '[method]output-stream.blocking-splice',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_47_metadata = {
+    qualifiedImportFn: 'wasi:cli/terminal-stdin@0.2.3#get-terminal-stdin',
+    moduleIdx: null,
+  };
+  
+  const handleTable28 = [T_FLAG, 0];
+  const captureTable4= new Map();
+  let captureCnt4 = 0;
+  handleTables[28] = handleTable28;
+  
+  function trampoline67(arg0) {
+    _debugLog('[iface="wasi:cli/terminal-stdin@0.2.3", function="get-terminal-stdin"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getTerminalStdin?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getTerminalStdin',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getTerminalStdin();
+    endCurrentTask(3);
+    var variant1 = ret;
+    if (variant1 === null || variant1=== undefined) {
+      dataView(memory0).setInt8(arg0 + 0, 0, true);
+    } else {
+      const e = variant1;
+      dataView(memory0).setInt8(arg0 + 0, 1, true);
+      if (!(e instanceof TerminalInput)) {
+        throw new TypeError('Resource error: Not a valid "TerminalInput" resource.');
+      }
+      var handle0 = e[symbolRscHandle];
+      if (!handle0) {
+        const rep = e[symbolRscRep] || ++captureCnt4;
+        captureTable4.set(rep, e);
+        handle0 = rscTableCreateOwn(handleTable28, rep);
+      }
+      dataView(memory0).setInt32(arg0 + 4, handle0, true);
+    }
+    _debugLog('[iface="wasi:cli/terminal-stdin@0.2.3", function="get-terminal-stdin"][Instruction::Return]', {
+      funcName: 'get-terminal-stdin',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_48_metadata = {
+    qualifiedImportFn: 'wasi:cli/terminal-stdout@0.2.3#get-terminal-stdout',
+    moduleIdx: null,
+  };
+  
+  const handleTable29 = [T_FLAG, 0];
+  const captureTable5= new Map();
+  let captureCnt5 = 0;
+  handleTables[29] = handleTable29;
+  
+  function trampoline68(arg0) {
+    _debugLog('[iface="wasi:cli/terminal-stdout@0.2.3", function="get-terminal-stdout"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getTerminalStdout?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getTerminalStdout',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getTerminalStdout();
+    endCurrentTask(3);
+    var variant1 = ret;
+    if (variant1 === null || variant1=== undefined) {
+      dataView(memory0).setInt8(arg0 + 0, 0, true);
+    } else {
+      const e = variant1;
+      dataView(memory0).setInt8(arg0 + 0, 1, true);
+      if (!(e instanceof TerminalOutput)) {
+        throw new TypeError('Resource error: Not a valid "TerminalOutput" resource.');
+      }
+      var handle0 = e[symbolRscHandle];
+      if (!handle0) {
+        const rep = e[symbolRscRep] || ++captureCnt5;
+        captureTable5.set(rep, e);
+        handle0 = rscTableCreateOwn(handleTable29, rep);
+      }
+      dataView(memory0).setInt32(arg0 + 4, handle0, true);
+    }
+    _debugLog('[iface="wasi:cli/terminal-stdout@0.2.3", function="get-terminal-stdout"][Instruction::Return]', {
+      funcName: 'get-terminal-stdout',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_49_metadata = {
+    qualifiedImportFn: 'wasi:cli/terminal-stderr@0.2.3#get-terminal-stderr',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline69(arg0) {
+    _debugLog('[iface="wasi:cli/terminal-stderr@0.2.3", function="get-terminal-stderr"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getTerminalStderr?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getTerminalStderr',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getTerminalStderr();
+    endCurrentTask(3);
+    var variant1 = ret;
+    if (variant1 === null || variant1=== undefined) {
+      dataView(memory0).setInt8(arg0 + 0, 0, true);
+    } else {
+      const e = variant1;
+      dataView(memory0).setInt8(arg0 + 0, 1, true);
+      if (!(e instanceof TerminalOutput)) {
+        throw new TypeError('Resource error: Not a valid "TerminalOutput" resource.');
+      }
+      var handle0 = e[symbolRscHandle];
+      if (!handle0) {
+        const rep = e[symbolRscRep] || ++captureCnt5;
+        captureTable5.set(rep, e);
+        handle0 = rscTableCreateOwn(handleTable29, rep);
+      }
+      dataView(memory0).setInt32(arg0 + 4, handle0, true);
+    }
+    _debugLog('[iface="wasi:cli/terminal-stderr@0.2.3", function="get-terminal-stderr"][Instruction::Return]', {
+      funcName: 'get-terminal-stderr',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_50_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#filesystem-error-code',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline70(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable19[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable0.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Error$1.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="filesystem-error-code"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = filesystemErrorCode?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'filesystemErrorCode',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  filesystemErrorCode(rsc0);
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    if (variant4 === null || variant4=== undefined) {
+      dataView(memory0).setInt8(arg1 + 0, 0, true);
+    } else {
+      const e = variant4;
+      dataView(memory0).setInt8(arg1 + 0, 1, true);
+      var val3 = e;
+      let enum3;
+      switch (val3) {
+        case 'access': {
+          enum3 = 0;
+          break;
+        }
+        case 'would-block': {
+          enum3 = 1;
+          break;
+        }
+        case 'already': {
+          enum3 = 2;
+          break;
+        }
+        case 'bad-descriptor': {
+          enum3 = 3;
+          break;
+        }
+        case 'busy': {
+          enum3 = 4;
+          break;
+        }
+        case 'deadlock': {
+          enum3 = 5;
+          break;
+        }
+        case 'quota': {
+          enum3 = 6;
+          break;
+        }
+        case 'exist': {
+          enum3 = 7;
+          break;
+        }
+        case 'file-too-large': {
+          enum3 = 8;
+          break;
+        }
+        case 'illegal-byte-sequence': {
+          enum3 = 9;
+          break;
+        }
+        case 'in-progress': {
+          enum3 = 10;
+          break;
+        }
+        case 'interrupted': {
+          enum3 = 11;
+          break;
+        }
+        case 'invalid': {
+          enum3 = 12;
+          break;
+        }
+        case 'io': {
+          enum3 = 13;
+          break;
+        }
+        case 'is-directory': {
+          enum3 = 14;
+          break;
+        }
+        case 'loop': {
+          enum3 = 15;
+          break;
+        }
+        case 'too-many-links': {
+          enum3 = 16;
+          break;
+        }
+        case 'message-size': {
+          enum3 = 17;
+          break;
+        }
+        case 'name-too-long': {
+          enum3 = 18;
+          break;
+        }
+        case 'no-device': {
+          enum3 = 19;
+          break;
+        }
+        case 'no-entry': {
+          enum3 = 20;
+          break;
+        }
+        case 'no-lock': {
+          enum3 = 21;
+          break;
+        }
+        case 'insufficient-memory': {
+          enum3 = 22;
+          break;
+        }
+        case 'insufficient-space': {
+          enum3 = 23;
+          break;
+        }
+        case 'not-directory': {
+          enum3 = 24;
+          break;
+        }
+        case 'not-empty': {
+          enum3 = 25;
+          break;
+        }
+        case 'not-recoverable': {
+          enum3 = 26;
+          break;
+        }
+        case 'unsupported': {
+          enum3 = 27;
+          break;
+        }
+        case 'no-tty': {
+          enum3 = 28;
+          break;
+        }
+        case 'no-such-device': {
+          enum3 = 29;
+          break;
+        }
+        case 'overflow': {
+          enum3 = 30;
+          break;
+        }
+        case 'not-permitted': {
+          enum3 = 31;
+          break;
+        }
+        case 'pipe': {
+          enum3 = 32;
+          break;
+        }
+        case 'read-only': {
+          enum3 = 33;
+          break;
+        }
+        case 'invalid-seek': {
+          enum3 = 34;
+          break;
+        }
+        case 'text-file-busy': {
+          enum3 = 35;
+          break;
+        }
+        case 'cross-device': {
+          enum3 = 36;
+          break;
+        }
+        default: {
+          if ((e) instanceof Error) {
+            console.error(e);
+          }
+          
+          throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+        }
+      }
+      dataView(memory0).setInt8(arg1 + 1, enum3, true);
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="filesystem-error-code"][Instruction::Return]', {
+      funcName: 'filesystem-error-code',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_51_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.read-via-stream',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline71(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.read-via-stream"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.readViaStream?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'readViaStream',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.readViaStream(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        if (!(e instanceof InputStream)) {
+          throw new TypeError('Resource error: Not a valid "InputStream" resource.');
+        }
+        var handle3 = e[symbolRscHandle];
+        if (!handle3) {
+          const rep = e[symbolRscRep] || ++captureCnt2;
+          captureTable2.set(rep, e);
+          handle3 = rscTableCreateOwn(handleTable15, rep);
+        }
+        dataView(memory0).setInt32(arg2 + 4, handle3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 4, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.read-via-stream"][Instruction::Return]', {
+      funcName: '[method]descriptor.read-via-stream',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_52_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.write-via-stream',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline72(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.write-via-stream"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.writeViaStream?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'writeViaStream',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.writeViaStream(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        if (!(e instanceof OutputStream)) {
+          throw new TypeError('Resource error: Not a valid "OutputStream" resource.');
+        }
+        var handle3 = e[symbolRscHandle];
+        if (!handle3) {
+          const rep = e[symbolRscRep] || ++captureCnt3;
+          captureTable3.set(rep, e);
+          handle3 = rscTableCreateOwn(handleTable16, rep);
+        }
+        dataView(memory0).setInt32(arg2 + 4, handle3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 4, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.write-via-stream"][Instruction::Return]', {
+      funcName: '[method]descriptor.write-via-stream',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_53_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.append-via-stream',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline73(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.append-via-stream"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.appendViaStream?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'appendViaStream',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.appendViaStream()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        if (!(e instanceof OutputStream)) {
+          throw new TypeError('Resource error: Not a valid "OutputStream" resource.');
+        }
+        var handle3 = e[symbolRscHandle];
+        if (!handle3) {
+          const rep = e[symbolRscRep] || ++captureCnt3;
+          captureTable3.set(rep, e);
+          handle3 = rscTableCreateOwn(handleTable16, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 4, handle3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.append-via-stream"][Instruction::Return]', {
+      funcName: '[method]descriptor.append-via-stream',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_54_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.advise',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline74(arg0, arg1, arg2, arg3, arg4) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    let enum3;
+    switch (arg3) {
+      case 0: {
+        enum3 = 'normal';
+        break;
+      }
+      case 1: {
+        enum3 = 'sequential';
+        break;
+      }
+      case 2: {
+        enum3 = 'random';
+        break;
+      }
+      case 3: {
+        enum3 = 'will-need';
+        break;
+      }
+      case 4: {
+        enum3 = 'dont-need';
+        break;
+      }
+      case 5: {
+        enum3 = 'no-reuse';
+        break;
+      }
+      default: {
+        throw new TypeError('invalid discriminant specified for Advice');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.advise"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.advise?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'advise',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.advise(BigInt.asUintN(64, arg1), BigInt.asUintN(64, arg2), enum3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg4 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg4 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg4 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.advise"][Instruction::Return]', {
+      funcName: '[method]descriptor.advise',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_55_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.sync-data',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline75(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.sync-data"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.syncData?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'syncData',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.syncData()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'access': {
+            enum3 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 1;
+            break;
+          }
+          case 'already': {
+            enum3 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum3 = 3;
+            break;
+          }
+          case 'busy': {
+            enum3 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum3 = 5;
+            break;
+          }
+          case 'quota': {
+            enum3 = 6;
+            break;
+          }
+          case 'exist': {
+            enum3 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum3 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum3 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum3 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum3 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum3 = 12;
+            break;
+          }
+          case 'io': {
+            enum3 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum3 = 14;
+            break;
+          }
+          case 'loop': {
+            enum3 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum3 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum3 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum3 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum3 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum3 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum3 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum3 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum3 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum3 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum3 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum3 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum3 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum3 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum3 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum3 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum3 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum3 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum3 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum3 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum3 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.sync-data"][Instruction::Return]', {
+      funcName: '[method]descriptor.sync-data',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_56_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.get-flags',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline76(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.get-flags"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.getFlags?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getFlags',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.getFlags()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        let flags3 = 0;
+        if (typeof e === 'object' && e !== null) {
+          flags3 = Boolean(e.read) << 0 | Boolean(e.write) << 1 | Boolean(e.fileIntegritySync) << 2 | Boolean(e.dataIntegritySync) << 3 | Boolean(e.requestedWriteSync) << 4 | Boolean(e.mutateDirectory) << 5;
+        } else if (e !== null && e!== undefined) {
+          throw new TypeError('only an object, undefined or null can be converted to flags');
+        }
+        dataView(memory0).setInt8(arg1 + 1, flags3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.get-flags"][Instruction::Return]', {
+      funcName: '[method]descriptor.get-flags',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_57_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.get-type',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline77(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.get-type"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.getType?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getType',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.getType()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'block-device': {
+            enum3 = 1;
+            break;
+          }
+          case 'character-device': {
+            enum3 = 2;
+            break;
+          }
+          case 'directory': {
+            enum3 = 3;
+            break;
+          }
+          case 'fifo': {
+            enum3 = 4;
+            break;
+          }
+          case 'symbolic-link': {
+            enum3 = 5;
+            break;
+          }
+          case 'regular-file': {
+            enum3 = 6;
+            break;
+          }
+          case 'socket': {
+            enum3 = 7;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of descriptor-type`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.get-type"][Instruction::Return]', {
+      funcName: '[method]descriptor.get-type',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_58_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.set-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline78(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.set-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setSize(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'access': {
+            enum3 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 1;
+            break;
+          }
+          case 'already': {
+            enum3 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum3 = 3;
+            break;
+          }
+          case 'busy': {
+            enum3 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum3 = 5;
+            break;
+          }
+          case 'quota': {
+            enum3 = 6;
+            break;
+          }
+          case 'exist': {
+            enum3 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum3 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum3 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum3 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum3 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum3 = 12;
+            break;
+          }
+          case 'io': {
+            enum3 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum3 = 14;
+            break;
+          }
+          case 'loop': {
+            enum3 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum3 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum3 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum3 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum3 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum3 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum3 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum3 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum3 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum3 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum3 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum3 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum3 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum3 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum3 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum3 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum3 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum3 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum3 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum3 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum3 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.set-size"][Instruction::Return]', {
+      funcName: '[method]descriptor.set-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_59_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.set-times',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline79(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    let variant3;
+    switch (arg1) {
+      case 0: {
+        variant3= {
+          tag: 'no-change',
+        };
+        break;
+      }
+      case 1: {
+        variant3= {
+          tag: 'now',
+        };
+        break;
+      }
+      case 2: {
+        variant3= {
+          tag: 'timestamp',
+          val: {
+            seconds: BigInt.asUintN(64, arg2),
+            nanoseconds: arg3 >>> 0,
+          }
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for NewTimestamp');
+      }
+    }
+    let variant4;
+    switch (arg4) {
+      case 0: {
+        variant4= {
+          tag: 'no-change',
+        };
+        break;
+      }
+      case 1: {
+        variant4= {
+          tag: 'now',
+        };
+        break;
+      }
+      case 2: {
+        variant4= {
+          tag: 'timestamp',
+          val: {
+            seconds: BigInt.asUintN(64, arg5),
+            nanoseconds: arg6 >>> 0,
+          }
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for NewTimestamp');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.set-times"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setTimes?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setTimes',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setTimes(variant3, variant4)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg7 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg7 + 0, 1, true);
+        var val5 = e;
+        let enum5;
+        switch (val5) {
+          case 'access': {
+            enum5 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum5 = 1;
+            break;
+          }
+          case 'already': {
+            enum5 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum5 = 3;
+            break;
+          }
+          case 'busy': {
+            enum5 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum5 = 5;
+            break;
+          }
+          case 'quota': {
+            enum5 = 6;
+            break;
+          }
+          case 'exist': {
+            enum5 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum5 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum5 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum5 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum5 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum5 = 12;
+            break;
+          }
+          case 'io': {
+            enum5 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum5 = 14;
+            break;
+          }
+          case 'loop': {
+            enum5 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum5 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum5 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum5 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum5 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum5 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum5 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum5 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum5 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum5 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum5 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum5 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum5 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum5 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum5 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum5 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum5 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum5 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum5 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum5 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum5 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum5 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val5}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg7 + 1, enum5, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.set-times"][Instruction::Return]', {
+      funcName: '[method]descriptor.set-times',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_60_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.read',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline80(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.read"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.read?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'read',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.read(BigInt.asUintN(64, arg1), BigInt.asUintN(64, arg2))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        var [tuple3_0, tuple3_1] = e;
+        var val4 = tuple3_0;
+        var len4 = val4.byteLength;
+        var ptr4 = realloc0(0, 0, 1, len4 * 1);
+        
+        let valData4;
+        const valLenBytes4 = len4 * 1;
+        if (Array.isArray(val4)) {
+          // Regular array likely containing numbers, write values to memory
+          let offset = 0;
+          const dv4 = new DataView(memory0.buffer);
+          for (const v of val4) {
+            dv4.setUint8(ptr4+ offset, v, true);
+            offset += 1;
+          }
+        } else {
+          // TypedArray / ArrayBuffer-like, direct copy
+          valData4 = new Uint8Array(val4.buffer || val4, val4.byteOffset, valLenBytes4);
+          const out4 = new Uint8Array(memory0.buffer, ptr4,valLenBytes4);
+          out4.set(valData4);
+        }
+        
+        dataView(memory0).setUint32(arg3 + 8, len4, true);
+        dataView(memory0).setUint32(arg3 + 4, ptr4, true);
+        dataView(memory0).setInt8(arg3 + 12, tuple3_1 ? 1 : 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var val5 = e;
+        let enum5;
+        switch (val5) {
+          case 'access': {
+            enum5 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum5 = 1;
+            break;
+          }
+          case 'already': {
+            enum5 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum5 = 3;
+            break;
+          }
+          case 'busy': {
+            enum5 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum5 = 5;
+            break;
+          }
+          case 'quota': {
+            enum5 = 6;
+            break;
+          }
+          case 'exist': {
+            enum5 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum5 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum5 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum5 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum5 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum5 = 12;
+            break;
+          }
+          case 'io': {
+            enum5 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum5 = 14;
+            break;
+          }
+          case 'loop': {
+            enum5 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum5 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum5 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum5 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum5 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum5 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum5 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum5 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum5 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum5 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum5 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum5 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum5 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum5 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum5 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum5 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum5 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum5 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum5 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum5 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum5 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum5 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val5}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg3 + 4, enum5, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.read"][Instruction::Return]', {
+      funcName: '[method]descriptor.read',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_61_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.write',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline81(arg0, arg1, arg2, arg3, arg4) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = new Uint8Array(memory0.buffer.slice(ptr3, ptr3 + len3 * 1));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.write"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.write?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'write',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.write(result3, BigInt.asUintN(64, arg3))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg4 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg4 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg4 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg4 + 8, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.write"][Instruction::Return]', {
+      funcName: '[method]descriptor.write',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_62_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.read-directory',
+    moduleIdx: null,
+  };
+  
+  const handleTable21 = [T_FLAG, 0];
+  const captureTable7= new Map();
+  let captureCnt7 = 0;
+  handleTables[21] = handleTable21;
+  
+  function trampoline82(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.read-directory"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.readDirectory?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'readDirectory',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.readDirectory()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        if (!(e instanceof DirectoryEntryStream)) {
+          throw new TypeError('Resource error: Not a valid "DirectoryEntryStream" resource.');
+        }
+        var handle3 = e[symbolRscHandle];
+        if (!handle3) {
+          const rep = e[symbolRscRep] || ++captureCnt7;
+          captureTable7.set(rep, e);
+          handle3 = rscTableCreateOwn(handleTable21, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 4, handle3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.read-directory"][Instruction::Return]', {
+      funcName: '[method]descriptor.read-directory',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_63_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.sync',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline83(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.sync"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.sync?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'sync',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.sync()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'access': {
+            enum3 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 1;
+            break;
+          }
+          case 'already': {
+            enum3 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum3 = 3;
+            break;
+          }
+          case 'busy': {
+            enum3 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum3 = 5;
+            break;
+          }
+          case 'quota': {
+            enum3 = 6;
+            break;
+          }
+          case 'exist': {
+            enum3 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum3 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum3 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum3 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum3 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum3 = 12;
+            break;
+          }
+          case 'io': {
+            enum3 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum3 = 14;
+            break;
+          }
+          case 'loop': {
+            enum3 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum3 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum3 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum3 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum3 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum3 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum3 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum3 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum3 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum3 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum3 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum3 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum3 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum3 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum3 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum3 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum3 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum3 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum3 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum3 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum3 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.sync"][Instruction::Return]', {
+      funcName: '[method]descriptor.sync',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_64_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.create-directory-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline84(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr3, len3));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.create-directory-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.createDirectoryAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'createDirectoryAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.createDirectoryAt(result3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg3 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.create-directory-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.create-directory-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_65_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.stat',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline85(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.stat"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.stat?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'stat',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.stat()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant12 = ret;
+    switch (variant12.tag) {
+      case 'ok': {
+        const e = variant12.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var {type: v3_0, linkCount: v3_1, size: v3_2, dataAccessTimestamp: v3_3, dataModificationTimestamp: v3_4, statusChangeTimestamp: v3_5 } = e;
+        var val4 = v3_0;
+        let enum4;
+        switch (val4) {
+          case 'unknown': {
+            enum4 = 0;
+            break;
+          }
+          case 'block-device': {
+            enum4 = 1;
+            break;
+          }
+          case 'character-device': {
+            enum4 = 2;
+            break;
+          }
+          case 'directory': {
+            enum4 = 3;
+            break;
+          }
+          case 'fifo': {
+            enum4 = 4;
+            break;
+          }
+          case 'symbolic-link': {
+            enum4 = 5;
+            break;
+          }
+          case 'regular-file': {
+            enum4 = 6;
+            break;
+          }
+          case 'socket': {
+            enum4 = 7;
+            break;
+          }
+          default: {
+            if ((v3_0) instanceof Error) {
+              console.error(v3_0);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of descriptor-type`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum4, true);
+        dataView(memory0).setBigInt64(arg1 + 16, toUint64(v3_1), true);
+        dataView(memory0).setBigInt64(arg1 + 24, toUint64(v3_2), true);
+        var variant6 = v3_3;
+        if (variant6 === null || variant6=== undefined) {
+          dataView(memory0).setInt8(arg1 + 32, 0, true);
+        } else {
+          const e = variant6;
+          dataView(memory0).setInt8(arg1 + 32, 1, true);
+          var {seconds: v5_0, nanoseconds: v5_1 } = e;
+          dataView(memory0).setBigInt64(arg1 + 40, toUint64(v5_0), true);
+          dataView(memory0).setInt32(arg1 + 48, toUint32(v5_1), true);
+        }
+        var variant8 = v3_4;
+        if (variant8 === null || variant8=== undefined) {
+          dataView(memory0).setInt8(arg1 + 56, 0, true);
+        } else {
+          const e = variant8;
+          dataView(memory0).setInt8(arg1 + 56, 1, true);
+          var {seconds: v7_0, nanoseconds: v7_1 } = e;
+          dataView(memory0).setBigInt64(arg1 + 64, toUint64(v7_0), true);
+          dataView(memory0).setInt32(arg1 + 72, toUint32(v7_1), true);
+        }
+        var variant10 = v3_5;
+        if (variant10 === null || variant10=== undefined) {
+          dataView(memory0).setInt8(arg1 + 80, 0, true);
+        } else {
+          const e = variant10;
+          dataView(memory0).setInt8(arg1 + 80, 1, true);
+          var {seconds: v9_0, nanoseconds: v9_1 } = e;
+          dataView(memory0).setBigInt64(arg1 + 88, toUint64(v9_0), true);
+          dataView(memory0).setInt32(arg1 + 96, toUint32(v9_1), true);
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant12.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val11 = e;
+        let enum11;
+        switch (val11) {
+          case 'access': {
+            enum11 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum11 = 1;
+            break;
+          }
+          case 'already': {
+            enum11 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum11 = 3;
+            break;
+          }
+          case 'busy': {
+            enum11 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum11 = 5;
+            break;
+          }
+          case 'quota': {
+            enum11 = 6;
+            break;
+          }
+          case 'exist': {
+            enum11 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum11 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum11 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum11 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum11 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum11 = 12;
+            break;
+          }
+          case 'io': {
+            enum11 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum11 = 14;
+            break;
+          }
+          case 'loop': {
+            enum11 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum11 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum11 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum11 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum11 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum11 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum11 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum11 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum11 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum11 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum11 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum11 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum11 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum11 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum11 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum11 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum11 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum11 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum11 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum11 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum11 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum11 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val11}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum11, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.stat"][Instruction::Return]', {
+      funcName: '[method]descriptor.stat',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_66_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.stat-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline86(arg0, arg1, arg2, arg3, arg4) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    if ((arg1 & 4294967294) !== 0) {
+      throw new TypeError('flags have extraneous bits set');
+    }
+    var flags3 = {
+      symlinkFollow: Boolean(arg1 & 1),
+    };
+    var ptr4 = arg2;
+    var len4 = arg3;
+    var result4 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr4, len4));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.stat-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.statAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'statAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.statAt(flags3, result4)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant14 = ret;
+    switch (variant14.tag) {
+      case 'ok': {
+        const e = variant14.val;
+        dataView(memory0).setInt8(arg4 + 0, 0, true);
+        var {type: v5_0, linkCount: v5_1, size: v5_2, dataAccessTimestamp: v5_3, dataModificationTimestamp: v5_4, statusChangeTimestamp: v5_5 } = e;
+        var val6 = v5_0;
+        let enum6;
+        switch (val6) {
+          case 'unknown': {
+            enum6 = 0;
+            break;
+          }
+          case 'block-device': {
+            enum6 = 1;
+            break;
+          }
+          case 'character-device': {
+            enum6 = 2;
+            break;
+          }
+          case 'directory': {
+            enum6 = 3;
+            break;
+          }
+          case 'fifo': {
+            enum6 = 4;
+            break;
+          }
+          case 'symbolic-link': {
+            enum6 = 5;
+            break;
+          }
+          case 'regular-file': {
+            enum6 = 6;
+            break;
+          }
+          case 'socket': {
+            enum6 = 7;
+            break;
+          }
+          default: {
+            if ((v5_0) instanceof Error) {
+              console.error(v5_0);
+            }
+            
+            throw new TypeError(`"${val6}" is not one of the cases of descriptor-type`);
+          }
+        }
+        dataView(memory0).setInt8(arg4 + 8, enum6, true);
+        dataView(memory0).setBigInt64(arg4 + 16, toUint64(v5_1), true);
+        dataView(memory0).setBigInt64(arg4 + 24, toUint64(v5_2), true);
+        var variant8 = v5_3;
+        if (variant8 === null || variant8=== undefined) {
+          dataView(memory0).setInt8(arg4 + 32, 0, true);
+        } else {
+          const e = variant8;
+          dataView(memory0).setInt8(arg4 + 32, 1, true);
+          var {seconds: v7_0, nanoseconds: v7_1 } = e;
+          dataView(memory0).setBigInt64(arg4 + 40, toUint64(v7_0), true);
+          dataView(memory0).setInt32(arg4 + 48, toUint32(v7_1), true);
+        }
+        var variant10 = v5_4;
+        if (variant10 === null || variant10=== undefined) {
+          dataView(memory0).setInt8(arg4 + 56, 0, true);
+        } else {
+          const e = variant10;
+          dataView(memory0).setInt8(arg4 + 56, 1, true);
+          var {seconds: v9_0, nanoseconds: v9_1 } = e;
+          dataView(memory0).setBigInt64(arg4 + 64, toUint64(v9_0), true);
+          dataView(memory0).setInt32(arg4 + 72, toUint32(v9_1), true);
+        }
+        var variant12 = v5_5;
+        if (variant12 === null || variant12=== undefined) {
+          dataView(memory0).setInt8(arg4 + 80, 0, true);
+        } else {
+          const e = variant12;
+          dataView(memory0).setInt8(arg4 + 80, 1, true);
+          var {seconds: v11_0, nanoseconds: v11_1 } = e;
+          dataView(memory0).setBigInt64(arg4 + 88, toUint64(v11_0), true);
+          dataView(memory0).setInt32(arg4 + 96, toUint32(v11_1), true);
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant14.val;
+        dataView(memory0).setInt8(arg4 + 0, 1, true);
+        var val13 = e;
+        let enum13;
+        switch (val13) {
+          case 'access': {
+            enum13 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum13 = 1;
+            break;
+          }
+          case 'already': {
+            enum13 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum13 = 3;
+            break;
+          }
+          case 'busy': {
+            enum13 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum13 = 5;
+            break;
+          }
+          case 'quota': {
+            enum13 = 6;
+            break;
+          }
+          case 'exist': {
+            enum13 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum13 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum13 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum13 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum13 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum13 = 12;
+            break;
+          }
+          case 'io': {
+            enum13 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum13 = 14;
+            break;
+          }
+          case 'loop': {
+            enum13 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum13 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum13 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum13 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum13 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum13 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum13 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum13 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum13 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum13 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum13 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum13 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum13 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum13 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum13 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum13 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum13 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum13 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum13 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum13 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum13 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum13 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val13}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg4 + 8, enum13, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.stat-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.stat-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_67_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.set-times-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline87(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    if ((arg1 & 4294967294) !== 0) {
+      throw new TypeError('flags have extraneous bits set');
+    }
+    var flags3 = {
+      symlinkFollow: Boolean(arg1 & 1),
+    };
+    var ptr4 = arg2;
+    var len4 = arg3;
+    var result4 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr4, len4));
+    let variant5;
+    switch (arg4) {
+      case 0: {
+        variant5= {
+          tag: 'no-change',
+        };
+        break;
+      }
+      case 1: {
+        variant5= {
+          tag: 'now',
+        };
+        break;
+      }
+      case 2: {
+        variant5= {
+          tag: 'timestamp',
+          val: {
+            seconds: BigInt.asUintN(64, arg5),
+            nanoseconds: arg6 >>> 0,
+          }
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for NewTimestamp');
+      }
+    }
+    let variant6;
+    switch (arg7) {
+      case 0: {
+        variant6= {
+          tag: 'no-change',
+        };
+        break;
+      }
+      case 1: {
+        variant6= {
+          tag: 'now',
+        };
+        break;
+      }
+      case 2: {
+        variant6= {
+          tag: 'timestamp',
+          val: {
+            seconds: BigInt.asUintN(64, arg8),
+            nanoseconds: arg9 >>> 0,
+          }
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for NewTimestamp');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.set-times-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setTimesAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setTimesAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setTimesAt(flags3, result4, variant5, variant6)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg10 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg10 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'access': {
+            enum7 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 1;
+            break;
+          }
+          case 'already': {
+            enum7 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum7 = 3;
+            break;
+          }
+          case 'busy': {
+            enum7 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum7 = 5;
+            break;
+          }
+          case 'quota': {
+            enum7 = 6;
+            break;
+          }
+          case 'exist': {
+            enum7 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum7 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum7 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum7 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum7 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum7 = 12;
+            break;
+          }
+          case 'io': {
+            enum7 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum7 = 14;
+            break;
+          }
+          case 'loop': {
+            enum7 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum7 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum7 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum7 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum7 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum7 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum7 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum7 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum7 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum7 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum7 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum7 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum7 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum7 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum7 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum7 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum7 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum7 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum7 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum7 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum7 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg10 + 1, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.set-times-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.set-times-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_68_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.link-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline88(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    if ((arg1 & 4294967294) !== 0) {
+      throw new TypeError('flags have extraneous bits set');
+    }
+    var flags3 = {
+      symlinkFollow: Boolean(arg1 & 1),
+    };
+    var ptr4 = arg2;
+    var len4 = arg3;
+    var result4 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr4, len4));
+    var handle6 = arg4;
+    var rep7 = handleTable20[(handle6 << 1) + 1] & ~T_FLAG;
+    var rsc5 = captureTable6.get(rep7);
+    if (!rsc5) {
+      rsc5 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc5, symbolRscHandle, { writable: true, value: handle6});
+      Object.defineProperty(rsc5, symbolRscRep, { writable: true, value: rep7});
+    }
+    curResourceBorrows.push(rsc5);
+    var ptr8 = arg5;
+    var len8 = arg6;
+    var result8 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr8, len8));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.link-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.linkAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'linkAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.linkAt(flags3, result4, rsc5, result8)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant10 = ret;
+    switch (variant10.tag) {
+      case 'ok': {
+        const e = variant10.val;
+        dataView(memory0).setInt8(arg7 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant10.val;
+        dataView(memory0).setInt8(arg7 + 0, 1, true);
+        var val9 = e;
+        let enum9;
+        switch (val9) {
+          case 'access': {
+            enum9 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum9 = 1;
+            break;
+          }
+          case 'already': {
+            enum9 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum9 = 3;
+            break;
+          }
+          case 'busy': {
+            enum9 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum9 = 5;
+            break;
+          }
+          case 'quota': {
+            enum9 = 6;
+            break;
+          }
+          case 'exist': {
+            enum9 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum9 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum9 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum9 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum9 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum9 = 12;
+            break;
+          }
+          case 'io': {
+            enum9 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum9 = 14;
+            break;
+          }
+          case 'loop': {
+            enum9 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum9 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum9 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum9 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum9 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum9 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum9 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum9 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum9 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum9 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum9 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum9 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum9 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum9 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum9 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum9 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum9 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum9 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum9 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum9 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum9 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum9 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val9}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg7 + 1, enum9, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.link-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.link-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_69_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.open-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline89(arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    if ((arg1 & 4294967294) !== 0) {
+      throw new TypeError('flags have extraneous bits set');
+    }
+    var flags3 = {
+      symlinkFollow: Boolean(arg1 & 1),
+    };
+    var ptr4 = arg2;
+    var len4 = arg3;
+    var result4 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr4, len4));
+    if ((arg4 & 4294967280) !== 0) {
+      throw new TypeError('flags have extraneous bits set');
+    }
+    var flags5 = {
+      create: Boolean(arg4 & 1),
+      directory: Boolean(arg4 & 2),
+      exclusive: Boolean(arg4 & 4),
+      truncate: Boolean(arg4 & 8),
+    };
+    if ((arg5 & 4294967232) !== 0) {
+      throw new TypeError('flags have extraneous bits set');
+    }
+    var flags6 = {
+      read: Boolean(arg5 & 1),
+      write: Boolean(arg5 & 2),
+      fileIntegritySync: Boolean(arg5 & 4),
+      dataIntegritySync: Boolean(arg5 & 8),
+      requestedWriteSync: Boolean(arg5 & 16),
+      mutateDirectory: Boolean(arg5 & 32),
+    };
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.open-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.openAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'openAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.openAt(flags3, result4, flags5, flags6)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant9 = ret;
+    switch (variant9.tag) {
+      case 'ok': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg6 + 0, 0, true);
+        if (!(e instanceof Descriptor)) {
+          throw new TypeError('Resource error: Not a valid "Descriptor" resource.');
+        }
+        var handle7 = e[symbolRscHandle];
+        if (!handle7) {
+          const rep = e[symbolRscRep] || ++captureCnt6;
+          captureTable6.set(rep, e);
+          handle7 = rscTableCreateOwn(handleTable20, rep);
+        }
+        dataView(memory0).setInt32(arg6 + 4, handle7, true);
+        break;
+      }
+      case 'err': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg6 + 0, 1, true);
+        var val8 = e;
+        let enum8;
+        switch (val8) {
+          case 'access': {
+            enum8 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum8 = 1;
+            break;
+          }
+          case 'already': {
+            enum8 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum8 = 3;
+            break;
+          }
+          case 'busy': {
+            enum8 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum8 = 5;
+            break;
+          }
+          case 'quota': {
+            enum8 = 6;
+            break;
+          }
+          case 'exist': {
+            enum8 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum8 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum8 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum8 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum8 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum8 = 12;
+            break;
+          }
+          case 'io': {
+            enum8 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum8 = 14;
+            break;
+          }
+          case 'loop': {
+            enum8 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum8 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum8 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum8 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum8 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum8 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum8 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum8 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum8 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum8 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum8 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum8 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum8 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum8 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum8 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum8 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum8 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum8 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum8 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum8 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum8 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum8 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val8}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg6 + 4, enum8, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.open-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.open-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_70_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.readlink-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline90(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr3, len3));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.readlink-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.readlinkAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'readlinkAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.readlinkAt(result3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        
+        var encodeRes = _utf8AllocateAndEncode(e, realloc0, memory0);
+        var ptr4= encodeRes.ptr;
+        var len4 = encodeRes.len;
+        
+        dataView(memory0).setUint32(arg3 + 8, len4, true);
+        dataView(memory0).setUint32(arg3 + 4, ptr4, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var val5 = e;
+        let enum5;
+        switch (val5) {
+          case 'access': {
+            enum5 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum5 = 1;
+            break;
+          }
+          case 'already': {
+            enum5 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum5 = 3;
+            break;
+          }
+          case 'busy': {
+            enum5 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum5 = 5;
+            break;
+          }
+          case 'quota': {
+            enum5 = 6;
+            break;
+          }
+          case 'exist': {
+            enum5 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum5 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum5 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum5 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum5 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum5 = 12;
+            break;
+          }
+          case 'io': {
+            enum5 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum5 = 14;
+            break;
+          }
+          case 'loop': {
+            enum5 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum5 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum5 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum5 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum5 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum5 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum5 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum5 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum5 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum5 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum5 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum5 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum5 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum5 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum5 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum5 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum5 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum5 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum5 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum5 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum5 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum5 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val5}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg3 + 4, enum5, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.readlink-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.readlink-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_71_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.remove-directory-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline91(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr3, len3));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.remove-directory-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.removeDirectoryAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'removeDirectoryAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.removeDirectoryAt(result3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg3 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.remove-directory-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.remove-directory-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_72_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.rename-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline92(arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr3, len3));
+    var handle5 = arg3;
+    var rep6 = handleTable20[(handle5 << 1) + 1] & ~T_FLAG;
+    var rsc4 = captureTable6.get(rep6);
+    if (!rsc4) {
+      rsc4 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc4, symbolRscHandle, { writable: true, value: handle5});
+      Object.defineProperty(rsc4, symbolRscRep, { writable: true, value: rep6});
+    }
+    curResourceBorrows.push(rsc4);
+    var ptr7 = arg4;
+    var len7 = arg5;
+    var result7 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr7, len7));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.rename-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.renameAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'renameAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.renameAt(result3, rsc4, result7)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant9 = ret;
+    switch (variant9.tag) {
+      case 'ok': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg6 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg6 + 0, 1, true);
+        var val8 = e;
+        let enum8;
+        switch (val8) {
+          case 'access': {
+            enum8 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum8 = 1;
+            break;
+          }
+          case 'already': {
+            enum8 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum8 = 3;
+            break;
+          }
+          case 'busy': {
+            enum8 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum8 = 5;
+            break;
+          }
+          case 'quota': {
+            enum8 = 6;
+            break;
+          }
+          case 'exist': {
+            enum8 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum8 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum8 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum8 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum8 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum8 = 12;
+            break;
+          }
+          case 'io': {
+            enum8 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum8 = 14;
+            break;
+          }
+          case 'loop': {
+            enum8 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum8 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum8 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum8 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum8 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum8 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum8 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum8 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum8 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum8 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum8 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum8 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum8 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum8 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum8 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum8 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum8 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum8 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum8 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum8 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum8 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum8 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val8}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg6 + 1, enum8, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.rename-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.rename-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_73_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.symlink-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline93(arg0, arg1, arg2, arg3, arg4, arg5) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr3, len3));
+    var ptr4 = arg3;
+    var len4 = arg4;
+    var result4 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr4, len4));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.symlink-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.symlinkAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'symlinkAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.symlinkAt(result3, result4)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg5 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg5 + 0, 1, true);
+        var val5 = e;
+        let enum5;
+        switch (val5) {
+          case 'access': {
+            enum5 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum5 = 1;
+            break;
+          }
+          case 'already': {
+            enum5 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum5 = 3;
+            break;
+          }
+          case 'busy': {
+            enum5 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum5 = 5;
+            break;
+          }
+          case 'quota': {
+            enum5 = 6;
+            break;
+          }
+          case 'exist': {
+            enum5 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum5 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum5 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum5 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum5 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum5 = 12;
+            break;
+          }
+          case 'io': {
+            enum5 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum5 = 14;
+            break;
+          }
+          case 'loop': {
+            enum5 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum5 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum5 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum5 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum5 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum5 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum5 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum5 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum5 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum5 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum5 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum5 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum5 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum5 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum5 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum5 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum5 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum5 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum5 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum5 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum5 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum5 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val5}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg5 + 1, enum5, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.symlink-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.symlink-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_74_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.unlink-file-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline94(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr3, len3));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.unlink-file-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.unlinkFileAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'unlinkFileAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.unlinkFileAt(result3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg3 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.unlink-file-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.unlink-file-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_75_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.metadata-hash',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline95(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.metadata-hash"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.metadataHash?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'metadataHash',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.metadataHash()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var {lower: v3_0, upper: v3_1 } = e;
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(v3_0), true);
+        dataView(memory0).setBigInt64(arg1 + 16, toUint64(v3_1), true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'access': {
+            enum4 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 1;
+            break;
+          }
+          case 'already': {
+            enum4 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum4 = 3;
+            break;
+          }
+          case 'busy': {
+            enum4 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum4 = 5;
+            break;
+          }
+          case 'quota': {
+            enum4 = 6;
+            break;
+          }
+          case 'exist': {
+            enum4 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum4 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum4 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum4 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum4 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum4 = 12;
+            break;
+          }
+          case 'io': {
+            enum4 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum4 = 14;
+            break;
+          }
+          case 'loop': {
+            enum4 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum4 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum4 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum4 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum4 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum4 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum4 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum4 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum4 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum4 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum4 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum4 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum4 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum4 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum4 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum4 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum4 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum4 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum4 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum4 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum4 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.metadata-hash"][Instruction::Return]', {
+      funcName: '[method]descriptor.metadata-hash',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_76_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]descriptor.metadata-hash-at',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline96(arg0, arg1, arg2, arg3, arg4) {
+    var handle1 = arg0;
+    var rep2 = handleTable20[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable6.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Descriptor.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    if ((arg1 & 4294967294) !== 0) {
+      throw new TypeError('flags have extraneous bits set');
+    }
+    var flags3 = {
+      symlinkFollow: Boolean(arg1 & 1),
+    };
+    var ptr4 = arg2;
+    var len4 = arg3;
+    var result4 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr4, len4));
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.metadata-hash-at"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.metadataHashAt?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'metadataHashAt',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.metadataHashAt(flags3, result4)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant7 = ret;
+    switch (variant7.tag) {
+      case 'ok': {
+        const e = variant7.val;
+        dataView(memory0).setInt8(arg4 + 0, 0, true);
+        var {lower: v5_0, upper: v5_1 } = e;
+        dataView(memory0).setBigInt64(arg4 + 8, toUint64(v5_0), true);
+        dataView(memory0).setBigInt64(arg4 + 16, toUint64(v5_1), true);
+        break;
+      }
+      case 'err': {
+        const e = variant7.val;
+        dataView(memory0).setInt8(arg4 + 0, 1, true);
+        var val6 = e;
+        let enum6;
+        switch (val6) {
+          case 'access': {
+            enum6 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum6 = 1;
+            break;
+          }
+          case 'already': {
+            enum6 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum6 = 3;
+            break;
+          }
+          case 'busy': {
+            enum6 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum6 = 5;
+            break;
+          }
+          case 'quota': {
+            enum6 = 6;
+            break;
+          }
+          case 'exist': {
+            enum6 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum6 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum6 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum6 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum6 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum6 = 12;
+            break;
+          }
+          case 'io': {
+            enum6 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum6 = 14;
+            break;
+          }
+          case 'loop': {
+            enum6 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum6 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum6 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum6 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum6 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum6 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum6 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum6 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum6 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum6 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum6 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum6 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum6 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum6 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum6 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum6 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum6 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum6 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum6 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum6 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum6 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum6 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val6}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg4 + 8, enum6, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]descriptor.metadata-hash-at"][Instruction::Return]', {
+      funcName: '[method]descriptor.metadata-hash-at',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_77_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]directory-entry-stream.read-directory-entry',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline97(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable21[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable7.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(DirectoryEntryStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]directory-entry-stream.read-directory-entry"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.readDirectoryEntry?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'readDirectoryEntry',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.readDirectoryEntry()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var variant6 = e;
+        if (variant6 === null || variant6=== undefined) {
+          dataView(memory0).setInt8(arg1 + 4, 0, true);
+        } else {
+          const e = variant6;
+          dataView(memory0).setInt8(arg1 + 4, 1, true);
+          var {type: v3_0, name: v3_1 } = e;
+          var val4 = v3_0;
+          let enum4;
+          switch (val4) {
+            case 'unknown': {
+              enum4 = 0;
+              break;
+            }
+            case 'block-device': {
+              enum4 = 1;
+              break;
+            }
+            case 'character-device': {
+              enum4 = 2;
+              break;
+            }
+            case 'directory': {
+              enum4 = 3;
+              break;
+            }
+            case 'fifo': {
+              enum4 = 4;
+              break;
+            }
+            case 'symbolic-link': {
+              enum4 = 5;
+              break;
+            }
+            case 'regular-file': {
+              enum4 = 6;
+              break;
+            }
+            case 'socket': {
+              enum4 = 7;
+              break;
+            }
+            default: {
+              if ((v3_0) instanceof Error) {
+                console.error(v3_0);
+              }
+              
+              throw new TypeError(`"${val4}" is not one of the cases of descriptor-type`);
+            }
+          }
+          dataView(memory0).setInt8(arg1 + 8, enum4, true);
+          
+          var encodeRes = _utf8AllocateAndEncode(v3_1, realloc0, memory0);
+          var ptr5= encodeRes.ptr;
+          var len5 = encodeRes.len;
+          
+          dataView(memory0).setUint32(arg1 + 16, len5, true);
+          dataView(memory0).setUint32(arg1 + 12, ptr5, true);
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'access': {
+            enum7 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 1;
+            break;
+          }
+          case 'already': {
+            enum7 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum7 = 3;
+            break;
+          }
+          case 'busy': {
+            enum7 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum7 = 5;
+            break;
+          }
+          case 'quota': {
+            enum7 = 6;
+            break;
+          }
+          case 'exist': {
+            enum7 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum7 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum7 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum7 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum7 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum7 = 12;
+            break;
+          }
+          case 'io': {
+            enum7 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum7 = 14;
+            break;
+          }
+          case 'loop': {
+            enum7 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum7 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum7 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum7 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum7 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum7 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum7 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum7 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum7 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum7 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum7 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum7 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum7 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum7 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum7 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum7 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum7 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum7 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum7 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum7 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum7 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]directory-entry-stream.read-directory-entry"][Instruction::Return]', {
+      funcName: '[method]directory-entry-stream.read-directory-entry',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_78_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/preopens@0.2.3#get-directories',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline98(arg0) {
+    _debugLog('[iface="wasi:filesystem/preopens@0.2.3", function="get-directories"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getDirectories?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getDirectories',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getDirectories();
+    endCurrentTask(3);
+    var vec3 = ret;
+    var len3 = vec3.length;
+    var result3 = realloc0(0, 0, 4, len3 * 12);
+    for (let i = 0; i < vec3.length; i++) {
+      const e = vec3[i];
+      const base = result3 + i * 12;var [tuple0_0, tuple0_1] = e;
+      if (!(tuple0_0 instanceof Descriptor)) {
+        throw new TypeError('Resource error: Not a valid "Descriptor" resource.');
+      }
+      var handle1 = tuple0_0[symbolRscHandle];
+      if (!handle1) {
+        const rep = tuple0_0[symbolRscRep] || ++captureCnt6;
+        captureTable6.set(rep, tuple0_0);
+        handle1 = rscTableCreateOwn(handleTable20, rep);
+      }
+      dataView(memory0).setInt32(base + 0, handle1, true);
+      
+      var encodeRes = _utf8AllocateAndEncode(tuple0_1, realloc0, memory0);
+      var ptr2= encodeRes.ptr;
+      var len2 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 8, len2, true);
+      dataView(memory0).setUint32(base + 4, ptr2, true);
+    }
+    dataView(memory0).setUint32(arg0 + 4, len3, true);
+    dataView(memory0).setUint32(arg0 + 0, result3, true);
+    _debugLog('[iface="wasi:filesystem/preopens@0.2.3", function="get-directories"][Instruction::Return]', {
+      funcName: 'get-directories',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_79_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.start-bind',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline99(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13, arg14) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var handle4 = arg1;
+    var rep5 = handleTable18[(handle4 << 1) + 1] & ~T_FLAG;
+    var rsc3 = captureTable8.get(rep5);
+    if (!rsc3) {
+      rsc3 = Object.create(Network.prototype);
+      Object.defineProperty(rsc3, symbolRscHandle, { writable: true, value: handle4});
+      Object.defineProperty(rsc3, symbolRscRep, { writable: true, value: rep5});
+    }
+    curResourceBorrows.push(rsc3);
+    let variant6;
+    switch (arg2) {
+      case 0: {
+        variant6= {
+          tag: 'ipv4',
+          val: {
+            port: clampGuest(arg3, 0, 65535),
+            address: [clampGuest(arg4, 0, 255), clampGuest(arg5, 0, 255), clampGuest(arg6, 0, 255), clampGuest(arg7, 0, 255)],
+          }
+        };
+        break;
+      }
+      case 1: {
+        variant6= {
+          tag: 'ipv6',
+          val: {
+            port: clampGuest(arg3, 0, 65535),
+            flowInfo: arg4 >>> 0,
+            address: [clampGuest(arg5, 0, 65535), clampGuest(arg6, 0, 65535), clampGuest(arg7, 0, 65535), clampGuest(arg8, 0, 65535), clampGuest(arg9, 0, 65535), clampGuest(arg10, 0, 65535), clampGuest(arg11, 0, 65535), clampGuest(arg12, 0, 65535)],
+            scopeId: arg13 >>> 0,
+          }
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for IpSocketAddress');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.start-bind"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.startBind?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'startBind',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.startBind(rsc3, variant6)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg14 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg14 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'unknown': {
+            enum7 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum7 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum7 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum7 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum7 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum7 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum7 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum7 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum7 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum7 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum7 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum7 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum7 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum7 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum7 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum7 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum7 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum7 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum7 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg14 + 1, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.start-bind"][Instruction::Return]', {
+      funcName: '[method]udp-socket.start-bind',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_80_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.finish-bind',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline100(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.finish-bind"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.finishBind?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'finishBind',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.finishBind()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.finish-bind"][Instruction::Return]', {
+      funcName: '[method]udp-socket.finish-bind',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_81_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.stream',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline101(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13, arg14) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    let variant4;
+    switch (arg1) {
+      case 0: {
+        variant4 = undefined;
+        break;
+      }
+      case 1: {
+        let variant3;
+        switch (arg2) {
+          case 0: {
+            variant3= {
+              tag: 'ipv4',
+              val: {
+                port: clampGuest(arg3, 0, 65535),
+                address: [clampGuest(arg4, 0, 255), clampGuest(arg5, 0, 255), clampGuest(arg6, 0, 255), clampGuest(arg7, 0, 255)],
+              }
+            };
+            break;
+          }
+          case 1: {
+            variant3= {
+              tag: 'ipv6',
+              val: {
+                port: clampGuest(arg3, 0, 65535),
+                flowInfo: arg4 >>> 0,
+                address: [clampGuest(arg5, 0, 65535), clampGuest(arg6, 0, 65535), clampGuest(arg7, 0, 65535), clampGuest(arg8, 0, 65535), clampGuest(arg9, 0, 65535), clampGuest(arg10, 0, 65535), clampGuest(arg11, 0, 65535), clampGuest(arg12, 0, 65535)],
+                scopeId: arg13 >>> 0,
+              }
+            };
+            break;
+          }
+          default: {
+            throw new TypeError('invalid variant discriminant for IpSocketAddress');
+          }
+        }
+        variant4 = variant3;
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for option');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.stream"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.stream?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'stream',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.stream(variant4)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant9 = ret;
+    switch (variant9.tag) {
+      case 'ok': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg14 + 0, 0, true);
+        var [tuple5_0, tuple5_1] = e;
+        if (!(tuple5_0 instanceof IncomingDatagramStream)) {
+          throw new TypeError('Resource error: Not a valid "IncomingDatagramStream" resource.');
+        }
+        var handle6 = tuple5_0[symbolRscHandle];
+        if (!handle6) {
+          const rep = tuple5_0[symbolRscRep] || ++captureCnt10;
+          captureTable10.set(rep, tuple5_0);
+          handle6 = rscTableCreateOwn(handleTable23, rep);
+        }
+        dataView(memory0).setInt32(arg14 + 4, handle6, true);
+        if (!(tuple5_1 instanceof OutgoingDatagramStream)) {
+          throw new TypeError('Resource error: Not a valid "OutgoingDatagramStream" resource.');
+        }
+        var handle7 = tuple5_1[symbolRscHandle];
+        if (!handle7) {
+          const rep = tuple5_1[symbolRscRep] || ++captureCnt11;
+          captureTable11.set(rep, tuple5_1);
+          handle7 = rscTableCreateOwn(handleTable24, rep);
+        }
+        dataView(memory0).setInt32(arg14 + 8, handle7, true);
+        break;
+      }
+      case 'err': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg14 + 0, 1, true);
+        var val8 = e;
+        let enum8;
+        switch (val8) {
+          case 'unknown': {
+            enum8 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum8 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum8 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum8 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum8 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum8 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum8 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum8 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum8 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum8 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum8 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum8 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum8 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum8 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum8 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum8 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum8 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum8 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum8 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum8 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum8 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val8}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg14 + 4, enum8, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.stream"][Instruction::Return]', {
+      funcName: '[method]udp-socket.stream',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_82_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.local-address',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline102(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.local-address"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.localAddress?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'localAddress',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.localAddress()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant9 = ret;
+    switch (variant9.tag) {
+      case 'ok': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var variant7 = e;
+        switch (variant7.tag) {
+          case 'ipv4': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 0, true);
+            var {port: v3_0, address: v3_1 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v3_0), true);
+            var [tuple4_0, tuple4_1, tuple4_2, tuple4_3] = v3_1;
+            dataView(memory0).setInt8(arg1 + 10, toUint8(tuple4_0), true);
+            dataView(memory0).setInt8(arg1 + 11, toUint8(tuple4_1), true);
+            dataView(memory0).setInt8(arg1 + 12, toUint8(tuple4_2), true);
+            dataView(memory0).setInt8(arg1 + 13, toUint8(tuple4_3), true);
+            break;
+          }
+          case 'ipv6': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 1, true);
+            var {port: v5_0, flowInfo: v5_1, address: v5_2, scopeId: v5_3 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v5_0), true);
+            dataView(memory0).setInt32(arg1 + 12, toUint32(v5_1), true);
+            var [tuple6_0, tuple6_1, tuple6_2, tuple6_3, tuple6_4, tuple6_5, tuple6_6, tuple6_7] = v5_2;
+            dataView(memory0).setInt16(arg1 + 16, toUint16(tuple6_0), true);
+            dataView(memory0).setInt16(arg1 + 18, toUint16(tuple6_1), true);
+            dataView(memory0).setInt16(arg1 + 20, toUint16(tuple6_2), true);
+            dataView(memory0).setInt16(arg1 + 22, toUint16(tuple6_3), true);
+            dataView(memory0).setInt16(arg1 + 24, toUint16(tuple6_4), true);
+            dataView(memory0).setInt16(arg1 + 26, toUint16(tuple6_5), true);
+            dataView(memory0).setInt16(arg1 + 28, toUint16(tuple6_6), true);
+            dataView(memory0).setInt16(arg1 + 30, toUint16(tuple6_7), true);
+            dataView(memory0).setInt32(arg1 + 32, toUint32(v5_3), true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant7.tag)}\` (received \`${variant7}\`) specified for \`IpSocketAddress\``);
+          }
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val8 = e;
+        let enum8;
+        switch (val8) {
+          case 'unknown': {
+            enum8 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum8 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum8 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum8 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum8 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum8 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum8 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum8 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum8 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum8 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum8 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum8 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum8 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum8 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum8 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum8 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum8 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum8 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum8 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum8 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum8 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val8}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum8, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.local-address"][Instruction::Return]', {
+      funcName: '[method]udp-socket.local-address',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_83_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.remote-address',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline103(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.remote-address"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.remoteAddress?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'remoteAddress',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.remoteAddress()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant9 = ret;
+    switch (variant9.tag) {
+      case 'ok': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var variant7 = e;
+        switch (variant7.tag) {
+          case 'ipv4': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 0, true);
+            var {port: v3_0, address: v3_1 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v3_0), true);
+            var [tuple4_0, tuple4_1, tuple4_2, tuple4_3] = v3_1;
+            dataView(memory0).setInt8(arg1 + 10, toUint8(tuple4_0), true);
+            dataView(memory0).setInt8(arg1 + 11, toUint8(tuple4_1), true);
+            dataView(memory0).setInt8(arg1 + 12, toUint8(tuple4_2), true);
+            dataView(memory0).setInt8(arg1 + 13, toUint8(tuple4_3), true);
+            break;
+          }
+          case 'ipv6': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 1, true);
+            var {port: v5_0, flowInfo: v5_1, address: v5_2, scopeId: v5_3 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v5_0), true);
+            dataView(memory0).setInt32(arg1 + 12, toUint32(v5_1), true);
+            var [tuple6_0, tuple6_1, tuple6_2, tuple6_3, tuple6_4, tuple6_5, tuple6_6, tuple6_7] = v5_2;
+            dataView(memory0).setInt16(arg1 + 16, toUint16(tuple6_0), true);
+            dataView(memory0).setInt16(arg1 + 18, toUint16(tuple6_1), true);
+            dataView(memory0).setInt16(arg1 + 20, toUint16(tuple6_2), true);
+            dataView(memory0).setInt16(arg1 + 22, toUint16(tuple6_3), true);
+            dataView(memory0).setInt16(arg1 + 24, toUint16(tuple6_4), true);
+            dataView(memory0).setInt16(arg1 + 26, toUint16(tuple6_5), true);
+            dataView(memory0).setInt16(arg1 + 28, toUint16(tuple6_6), true);
+            dataView(memory0).setInt16(arg1 + 30, toUint16(tuple6_7), true);
+            dataView(memory0).setInt32(arg1 + 32, toUint32(v5_3), true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant7.tag)}\` (received \`${variant7}\`) specified for \`IpSocketAddress\``);
+          }
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val8 = e;
+        let enum8;
+        switch (val8) {
+          case 'unknown': {
+            enum8 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum8 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum8 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum8 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum8 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum8 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum8 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum8 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum8 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum8 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum8 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum8 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum8 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum8 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum8 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum8 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum8 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum8 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum8 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum8 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum8 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val8}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum8, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.remote-address"][Instruction::Return]', {
+      funcName: '[method]udp-socket.remote-address',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_84_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.unicast-hop-limit',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline104(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.unicast-hop-limit"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.unicastHopLimit?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'unicastHopLimit',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.unicastHopLimit()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setInt8(arg1 + 1, toUint8(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.unicast-hop-limit"][Instruction::Return]', {
+      funcName: '[method]udp-socket.unicast-hop-limit',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_85_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.set-unicast-hop-limit',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline105(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.set-unicast-hop-limit"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setUnicastHopLimit?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setUnicastHopLimit',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setUnicastHopLimit(clampGuest(arg1, 0, 255))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.set-unicast-hop-limit"][Instruction::Return]', {
+      funcName: '[method]udp-socket.set-unicast-hop-limit',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_86_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.receive-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline106(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.receive-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.receiveBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'receiveBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.receiveBufferSize()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.receive-buffer-size"][Instruction::Return]', {
+      funcName: '[method]udp-socket.receive-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_87_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.set-receive-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline107(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.set-receive-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setReceiveBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setReceiveBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setReceiveBufferSize(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.set-receive-buffer-size"][Instruction::Return]', {
+      funcName: '[method]udp-socket.set-receive-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_88_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.send-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline108(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.send-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.sendBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'sendBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.sendBufferSize()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.send-buffer-size"][Instruction::Return]', {
+      funcName: '[method]udp-socket.send-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_89_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]udp-socket.set-send-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline109(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable22[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable9.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(UdpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.set-send-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setSendBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setSendBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setSendBufferSize(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]udp-socket.set-send-buffer-size"][Instruction::Return]', {
+      funcName: '[method]udp-socket.set-send-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_90_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]incoming-datagram-stream.receive',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline110(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable23[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable10.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(IncomingDatagramStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]incoming-datagram-stream.receive"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.receive?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'receive',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.receive(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant12 = ret;
+    switch (variant12.tag) {
+      case 'ok': {
+        const e = variant12.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        var vec10 = e;
+        var len10 = vec10.length;
+        var result10 = realloc0(0, 0, 4, len10 * 40);
+        for (let i = 0; i < vec10.length; i++) {
+          const e = vec10[i];
+          const base = result10 + i * 40;var {data: v3_0, remoteAddress: v3_1 } = e;
+          var val4 = v3_0;
+          var len4 = val4.byteLength;
+          var ptr4 = realloc0(0, 0, 1, len4 * 1);
+          
+          let valData4;
+          const valLenBytes4 = len4 * 1;
+          if (Array.isArray(val4)) {
+            // Regular array likely containing numbers, write values to memory
+            let offset = 0;
+            const dv4 = new DataView(memory0.buffer);
+            for (const v of val4) {
+              dv4.setUint8(ptr4+ offset, v, true);
+              offset += 1;
+            }
+          } else {
+            // TypedArray / ArrayBuffer-like, direct copy
+            valData4 = new Uint8Array(val4.buffer || val4, val4.byteOffset, valLenBytes4);
+            const out4 = new Uint8Array(memory0.buffer, ptr4,valLenBytes4);
+            out4.set(valData4);
+          }
+          
+          dataView(memory0).setUint32(base + 4, len4, true);
+          dataView(memory0).setUint32(base + 0, ptr4, true);
+          var variant9 = v3_1;
+          switch (variant9.tag) {
+            case 'ipv4': {
+              const e = variant9.val;
+              dataView(memory0).setInt8(base + 8, 0, true);
+              var {port: v5_0, address: v5_1 } = e;
+              dataView(memory0).setInt16(base + 12, toUint16(v5_0), true);
+              var [tuple6_0, tuple6_1, tuple6_2, tuple6_3] = v5_1;
+              dataView(memory0).setInt8(base + 14, toUint8(tuple6_0), true);
+              dataView(memory0).setInt8(base + 15, toUint8(tuple6_1), true);
+              dataView(memory0).setInt8(base + 16, toUint8(tuple6_2), true);
+              dataView(memory0).setInt8(base + 17, toUint8(tuple6_3), true);
+              break;
+            }
+            case 'ipv6': {
+              const e = variant9.val;
+              dataView(memory0).setInt8(base + 8, 1, true);
+              var {port: v7_0, flowInfo: v7_1, address: v7_2, scopeId: v7_3 } = e;
+              dataView(memory0).setInt16(base + 12, toUint16(v7_0), true);
+              dataView(memory0).setInt32(base + 16, toUint32(v7_1), true);
+              var [tuple8_0, tuple8_1, tuple8_2, tuple8_3, tuple8_4, tuple8_5, tuple8_6, tuple8_7] = v7_2;
+              dataView(memory0).setInt16(base + 20, toUint16(tuple8_0), true);
+              dataView(memory0).setInt16(base + 22, toUint16(tuple8_1), true);
+              dataView(memory0).setInt16(base + 24, toUint16(tuple8_2), true);
+              dataView(memory0).setInt16(base + 26, toUint16(tuple8_3), true);
+              dataView(memory0).setInt16(base + 28, toUint16(tuple8_4), true);
+              dataView(memory0).setInt16(base + 30, toUint16(tuple8_5), true);
+              dataView(memory0).setInt16(base + 32, toUint16(tuple8_6), true);
+              dataView(memory0).setInt16(base + 34, toUint16(tuple8_7), true);
+              dataView(memory0).setInt32(base + 36, toUint32(v7_3), true);
+              break;
+            }
+            default: {
+              throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant9.tag)}\` (received \`${variant9}\`) specified for \`IpSocketAddress\``);
+            }
+          }
+        }
+        dataView(memory0).setUint32(arg2 + 8, len10, true);
+        dataView(memory0).setUint32(arg2 + 4, result10, true);
+        break;
+      }
+      case 'err': {
+        const e = variant12.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val11 = e;
+        let enum11;
+        switch (val11) {
+          case 'unknown': {
+            enum11 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum11 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum11 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum11 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum11 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum11 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum11 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum11 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum11 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum11 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum11 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum11 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum11 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum11 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum11 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum11 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum11 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum11 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum11 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum11 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum11 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val11}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 4, enum11, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]incoming-datagram-stream.receive"][Instruction::Return]', {
+      funcName: '[method]incoming-datagram-stream.receive',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_91_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]outgoing-datagram-stream.check-send',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline111(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable24[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable11.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutgoingDatagramStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]outgoing-datagram-stream.check-send"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.checkSend?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'checkSend',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.checkSend()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]outgoing-datagram-stream.check-send"][Instruction::Return]', {
+      funcName: '[method]outgoing-datagram-stream.check-send',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_92_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp@0.2.3#[method]outgoing-datagram-stream.send',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline112(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable24[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable11.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(OutgoingDatagramStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var len6 = arg2;
+    var base6 = arg1;
+    var result6 = [];
+    for (let i = 0; i < len6; i++) {
+      const base = base6 + i * 44;
+      var ptr3 = dataView(memory0).getUint32(base + 0, true);
+      var len3 = dataView(memory0).getUint32(base + 4, true);
+      var result3 = new Uint8Array(memory0.buffer.slice(ptr3, ptr3 + len3 * 1));
+      let variant5;
+      switch (dataView(memory0).getUint8(base + 8, true)) {
+        case 0: {
+          variant5 = undefined;
+          break;
+        }
+        case 1: {
+          let variant4;
+          switch (dataView(memory0).getUint8(base + 12, true)) {
+            case 0: {
+              variant4= {
+                tag: 'ipv4',
+                val: {
+                  port: clampGuest(dataView(memory0).getUint16(base + 16, true), 0, 65535),
+                  address: [clampGuest(dataView(memory0).getUint8(base + 18, true), 0, 255), clampGuest(dataView(memory0).getUint8(base + 19, true), 0, 255), clampGuest(dataView(memory0).getUint8(base + 20, true), 0, 255), clampGuest(dataView(memory0).getUint8(base + 21, true), 0, 255)],
+                }
+              };
+              break;
+            }
+            case 1: {
+              variant4= {
+                tag: 'ipv6',
+                val: {
+                  port: clampGuest(dataView(memory0).getUint16(base + 16, true), 0, 65535),
+                  flowInfo: dataView(memory0).getInt32(base + 20, true) >>> 0,
+                  address: [clampGuest(dataView(memory0).getUint16(base + 24, true), 0, 65535), clampGuest(dataView(memory0).getUint16(base + 26, true), 0, 65535), clampGuest(dataView(memory0).getUint16(base + 28, true), 0, 65535), clampGuest(dataView(memory0).getUint16(base + 30, true), 0, 65535), clampGuest(dataView(memory0).getUint16(base + 32, true), 0, 65535), clampGuest(dataView(memory0).getUint16(base + 34, true), 0, 65535), clampGuest(dataView(memory0).getUint16(base + 36, true), 0, 65535), clampGuest(dataView(memory0).getUint16(base + 38, true), 0, 65535)],
+                  scopeId: dataView(memory0).getInt32(base + 40, true) >>> 0,
+                }
+              };
+              break;
+            }
+            default: {
+              throw new TypeError('invalid variant discriminant for IpSocketAddress');
+            }
+          }
+          variant5 = variant4;
+          break;
+        }
+        default: {
+          throw new TypeError('invalid variant discriminant for option');
+        }
+      }
+      result6.push({
+        data: result3,
+        remoteAddress: variant5,
+      });
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]outgoing-datagram-stream.send"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.send?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'send',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.send(result6)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg3 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'unknown': {
+            enum7 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum7 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum7 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum7 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum7 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum7 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum7 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum7 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum7 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum7 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum7 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum7 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum7 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum7 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum7 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum7 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum7 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum7 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum7 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg3 + 8, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp@0.2.3", function="[method]outgoing-datagram-stream.send"][Instruction::Return]', {
+      funcName: '[method]outgoing-datagram-stream.send',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_93_metadata = {
+    qualifiedImportFn: 'wasi:sockets/udp-create-socket@0.2.3#create-udp-socket',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline113(arg0, arg1) {
+    let enum0;
+    switch (arg0) {
+      case 0: {
+        enum0 = 'ipv4';
+        break;
+      }
+      case 1: {
+        enum0 = 'ipv6';
+        break;
+      }
+      default: {
+        throw new TypeError('invalid discriminant specified for IpAddressFamily');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp-create-socket@0.2.3", function="create-udp-socket"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = createUdpSocket?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'createUdpSocket',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  createUdpSocket(enum0)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    endCurrentTask(3);
+    var variant3 = ret;
+    switch (variant3.tag) {
+      case 'ok': {
+        const e = variant3.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        if (!(e instanceof UdpSocket)) {
+          throw new TypeError('Resource error: Not a valid "UdpSocket" resource.');
+        }
+        var handle1 = e[symbolRscHandle];
+        if (!handle1) {
+          const rep = e[symbolRscRep] || ++captureCnt9;
+          captureTable9.set(rep, e);
+          handle1 = rscTableCreateOwn(handleTable22, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 4, handle1, true);
+        break;
+      }
+      case 'err': {
+        const e = variant3.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val2 = e;
+        let enum2;
+        switch (val2) {
+          case 'unknown': {
+            enum2 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum2 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum2 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum2 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum2 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum2 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum2 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum2 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum2 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum2 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum2 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum2 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum2 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum2 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum2 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum2 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum2 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum2 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum2 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum2 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum2 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val2}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum2, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/udp-create-socket@0.2.3", function="create-udp-socket"][Instruction::Return]', {
+      funcName: 'create-udp-socket',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_94_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.start-bind',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline114(arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13, arg14) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var handle4 = arg1;
+    var rep5 = handleTable18[(handle4 << 1) + 1] & ~T_FLAG;
+    var rsc3 = captureTable8.get(rep5);
+    if (!rsc3) {
+      rsc3 = Object.create(Network.prototype);
+      Object.defineProperty(rsc3, symbolRscHandle, { writable: true, value: handle4});
+      Object.defineProperty(rsc3, symbolRscRep, { writable: true, value: rep5});
+    }
+    curResourceBorrows.push(rsc3);
+    let variant6;
+    switch (arg2) {
+      case 0: {
+        variant6= {
+          tag: 'ipv4',
+          val: {
+            port: clampGuest(arg3, 0, 65535),
+            address: [clampGuest(arg4, 0, 255), clampGuest(arg5, 0, 255), clampGuest(arg6, 0, 255), clampGuest(arg7, 0, 255)],
+          }
+        };
+        break;
+      }
+      case 1: {
+        variant6= {
+          tag: 'ipv6',
+          val: {
+            port: clampGuest(arg3, 0, 65535),
+            flowInfo: arg4 >>> 0,
+            address: [clampGuest(arg5, 0, 65535), clampGuest(arg6, 0, 65535), clampGuest(arg7, 0, 65535), clampGuest(arg8, 0, 65535), clampGuest(arg9, 0, 65535), clampGuest(arg10, 0, 65535), clampGuest(arg11, 0, 65535), clampGuest(arg12, 0, 65535)],
+            scopeId: arg13 >>> 0,
+          }
+        };
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant discriminant for IpSocketAddress');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.start-bind"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.startBind?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'startBind',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.startBind(rsc3, variant6)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg14 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg14 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'unknown': {
+            enum7 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum7 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum7 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum7 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum7 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum7 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum7 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum7 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum7 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum7 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum7 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum7 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum7 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum7 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum7 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum7 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum7 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum7 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum7 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg14 + 1, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.start-bind"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.start-bind',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_95_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.finish-bind',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline115(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.finish-bind"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.finishBind?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'finishBind',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.finishBind()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.finish-bind"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.finish-bind',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_96_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.start-listen',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline116(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.start-listen"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.startListen?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'startListen',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.startListen()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.start-listen"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.start-listen',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_97_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.finish-listen',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline117(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.finish-listen"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.finishListen?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'finishListen',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.finishListen()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.finish-listen"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.finish-listen',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_98_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.accept',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline118(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.accept"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.accept?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'accept',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.accept()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var [tuple3_0, tuple3_1, tuple3_2] = e;
+        if (!(tuple3_0 instanceof TcpSocket)) {
+          throw new TypeError('Resource error: Not a valid "TcpSocket" resource.');
+        }
+        var handle4 = tuple3_0[symbolRscHandle];
+        if (!handle4) {
+          const rep = tuple3_0[symbolRscRep] || ++captureCnt12;
+          captureTable12.set(rep, tuple3_0);
+          handle4 = rscTableCreateOwn(handleTable17, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 4, handle4, true);
+        if (!(tuple3_1 instanceof InputStream)) {
+          throw new TypeError('Resource error: Not a valid "InputStream" resource.');
+        }
+        var handle5 = tuple3_1[symbolRscHandle];
+        if (!handle5) {
+          const rep = tuple3_1[symbolRscRep] || ++captureCnt2;
+          captureTable2.set(rep, tuple3_1);
+          handle5 = rscTableCreateOwn(handleTable15, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 8, handle5, true);
+        if (!(tuple3_2 instanceof OutputStream)) {
+          throw new TypeError('Resource error: Not a valid "OutputStream" resource.');
+        }
+        var handle6 = tuple3_2[symbolRscHandle];
+        if (!handle6) {
+          const rep = tuple3_2[symbolRscRep] || ++captureCnt3;
+          captureTable3.set(rep, tuple3_2);
+          handle6 = rscTableCreateOwn(handleTable16, rep);
+        }
+        dataView(memory0).setInt32(arg1 + 12, handle6, true);
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'unknown': {
+            enum7 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum7 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum7 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum7 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum7 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum7 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum7 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum7 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum7 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum7 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum7 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum7 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum7 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum7 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum7 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum7 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum7 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum7 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum7 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.accept"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.accept',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_99_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.local-address',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline119(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.local-address"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.localAddress?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'localAddress',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.localAddress()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant9 = ret;
+    switch (variant9.tag) {
+      case 'ok': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var variant7 = e;
+        switch (variant7.tag) {
+          case 'ipv4': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 0, true);
+            var {port: v3_0, address: v3_1 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v3_0), true);
+            var [tuple4_0, tuple4_1, tuple4_2, tuple4_3] = v3_1;
+            dataView(memory0).setInt8(arg1 + 10, toUint8(tuple4_0), true);
+            dataView(memory0).setInt8(arg1 + 11, toUint8(tuple4_1), true);
+            dataView(memory0).setInt8(arg1 + 12, toUint8(tuple4_2), true);
+            dataView(memory0).setInt8(arg1 + 13, toUint8(tuple4_3), true);
+            break;
+          }
+          case 'ipv6': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 1, true);
+            var {port: v5_0, flowInfo: v5_1, address: v5_2, scopeId: v5_3 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v5_0), true);
+            dataView(memory0).setInt32(arg1 + 12, toUint32(v5_1), true);
+            var [tuple6_0, tuple6_1, tuple6_2, tuple6_3, tuple6_4, tuple6_5, tuple6_6, tuple6_7] = v5_2;
+            dataView(memory0).setInt16(arg1 + 16, toUint16(tuple6_0), true);
+            dataView(memory0).setInt16(arg1 + 18, toUint16(tuple6_1), true);
+            dataView(memory0).setInt16(arg1 + 20, toUint16(tuple6_2), true);
+            dataView(memory0).setInt16(arg1 + 22, toUint16(tuple6_3), true);
+            dataView(memory0).setInt16(arg1 + 24, toUint16(tuple6_4), true);
+            dataView(memory0).setInt16(arg1 + 26, toUint16(tuple6_5), true);
+            dataView(memory0).setInt16(arg1 + 28, toUint16(tuple6_6), true);
+            dataView(memory0).setInt16(arg1 + 30, toUint16(tuple6_7), true);
+            dataView(memory0).setInt32(arg1 + 32, toUint32(v5_3), true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant7.tag)}\` (received \`${variant7}\`) specified for \`IpSocketAddress\``);
+          }
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val8 = e;
+        let enum8;
+        switch (val8) {
+          case 'unknown': {
+            enum8 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum8 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum8 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum8 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum8 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum8 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum8 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum8 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum8 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum8 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum8 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum8 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum8 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum8 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum8 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum8 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum8 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum8 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum8 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum8 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum8 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val8}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum8, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.local-address"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.local-address',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_100_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.remote-address',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline120(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.remote-address"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.remoteAddress?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'remoteAddress',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.remoteAddress()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant9 = ret;
+    switch (variant9.tag) {
+      case 'ok': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var variant7 = e;
+        switch (variant7.tag) {
+          case 'ipv4': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 0, true);
+            var {port: v3_0, address: v3_1 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v3_0), true);
+            var [tuple4_0, tuple4_1, tuple4_2, tuple4_3] = v3_1;
+            dataView(memory0).setInt8(arg1 + 10, toUint8(tuple4_0), true);
+            dataView(memory0).setInt8(arg1 + 11, toUint8(tuple4_1), true);
+            dataView(memory0).setInt8(arg1 + 12, toUint8(tuple4_2), true);
+            dataView(memory0).setInt8(arg1 + 13, toUint8(tuple4_3), true);
+            break;
+          }
+          case 'ipv6': {
+            const e = variant7.val;
+            dataView(memory0).setInt8(arg1 + 4, 1, true);
+            var {port: v5_0, flowInfo: v5_1, address: v5_2, scopeId: v5_3 } = e;
+            dataView(memory0).setInt16(arg1 + 8, toUint16(v5_0), true);
+            dataView(memory0).setInt32(arg1 + 12, toUint32(v5_1), true);
+            var [tuple6_0, tuple6_1, tuple6_2, tuple6_3, tuple6_4, tuple6_5, tuple6_6, tuple6_7] = v5_2;
+            dataView(memory0).setInt16(arg1 + 16, toUint16(tuple6_0), true);
+            dataView(memory0).setInt16(arg1 + 18, toUint16(tuple6_1), true);
+            dataView(memory0).setInt16(arg1 + 20, toUint16(tuple6_2), true);
+            dataView(memory0).setInt16(arg1 + 22, toUint16(tuple6_3), true);
+            dataView(memory0).setInt16(arg1 + 24, toUint16(tuple6_4), true);
+            dataView(memory0).setInt16(arg1 + 26, toUint16(tuple6_5), true);
+            dataView(memory0).setInt16(arg1 + 28, toUint16(tuple6_6), true);
+            dataView(memory0).setInt16(arg1 + 30, toUint16(tuple6_7), true);
+            dataView(memory0).setInt32(arg1 + 32, toUint32(v5_3), true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant7.tag)}\` (received \`${variant7}\`) specified for \`IpSocketAddress\``);
+          }
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant9.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val8 = e;
+        let enum8;
+        switch (val8) {
+          case 'unknown': {
+            enum8 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum8 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum8 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum8 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum8 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum8 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum8 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum8 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum8 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum8 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum8 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum8 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum8 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum8 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum8 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum8 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum8 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum8 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum8 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum8 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum8 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val8}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum8, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.remote-address"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.remote-address',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_101_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-listen-backlog-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline121(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-listen-backlog-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setListenBacklogSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setListenBacklogSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setListenBacklogSize(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-listen-backlog-size"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-listen-backlog-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_102_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.keep-alive-enabled',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline122(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-enabled"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.keepAliveEnabled?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'keepAliveEnabled',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.keepAliveEnabled()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setInt8(arg1 + 1, e ? 1 : 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-enabled"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.keep-alive-enabled',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_103_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-keep-alive-enabled',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline123(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var bool3 = arg1;
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-enabled"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setKeepAliveEnabled?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setKeepAliveEnabled',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setKeepAliveEnabled(bool3 == 0 ? false : (bool3 == 1 ? true : throwInvalidBool()))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant5 = ret;
+    switch (variant5.tag) {
+      case 'ok': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant5.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val4 = e;
+        let enum4;
+        switch (val4) {
+          case 'unknown': {
+            enum4 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum4 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum4 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum4 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum4 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum4 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum4 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum4 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum4 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum4 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum4 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum4 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum4 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum4 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum4 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum4 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum4 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum4 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum4 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum4 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum4 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val4}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum4, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-enabled"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-keep-alive-enabled',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_104_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.keep-alive-idle-time',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline124(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-idle-time"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.keepAliveIdleTime?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'keepAliveIdleTime',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.keepAliveIdleTime()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-idle-time"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.keep-alive-idle-time',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_105_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-keep-alive-idle-time',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline125(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-idle-time"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setKeepAliveIdleTime?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setKeepAliveIdleTime',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setKeepAliveIdleTime(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-idle-time"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-keep-alive-idle-time',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_106_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.keep-alive-interval',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline126(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-interval"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.keepAliveInterval?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'keepAliveInterval',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.keepAliveInterval()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-interval"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.keep-alive-interval',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_107_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-keep-alive-interval',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline127(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-interval"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setKeepAliveInterval?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setKeepAliveInterval',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setKeepAliveInterval(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-interval"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-keep-alive-interval',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_108_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.keep-alive-count',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline128(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-count"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.keepAliveCount?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'keepAliveCount',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.keepAliveCount()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setInt32(arg1 + 4, toUint32(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.keep-alive-count"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.keep-alive-count',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_109_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-keep-alive-count',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline129(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-count"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setKeepAliveCount?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setKeepAliveCount',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setKeepAliveCount(arg1 >>> 0)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-keep-alive-count"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-keep-alive-count',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_110_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.hop-limit',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline130(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.hop-limit"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.hopLimit?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'hopLimit',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.hopLimit()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setInt8(arg1 + 1, toUint8(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.hop-limit"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.hop-limit',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_111_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-hop-limit',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline131(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-hop-limit"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setHopLimit?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setHopLimit',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setHopLimit(clampGuest(arg1, 0, 255))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-hop-limit"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-hop-limit',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_112_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.receive-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline132(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.receive-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.receiveBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'receiveBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.receiveBufferSize()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.receive-buffer-size"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.receive-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_113_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-receive-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline133(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-receive-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setReceiveBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setReceiveBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setReceiveBufferSize(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-receive-buffer-size"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-receive-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_114_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.send-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline134(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.send-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.sendBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'sendBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.sendBufferSize()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        dataView(memory0).setBigInt64(arg1 + 8, toUint64(e), true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 8, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.send-buffer-size"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.send-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_115_metadata = {
+    qualifiedImportFn: 'wasi:sockets/tcp@0.2.3#[method]tcp-socket.set-send-buffer-size',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline135(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable17[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable12.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(TcpSocket.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-send-buffer-size"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.setSendBufferSize?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'setSendBufferSize',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.setSendBufferSize(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant4 = ret;
+    switch (variant4.tag) {
+      case 'ok': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        break;
+      }
+      case 'err': {
+        const e = variant4.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var val3 = e;
+        let enum3;
+        switch (val3) {
+          case 'unknown': {
+            enum3 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum3 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum3 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum3 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum3 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum3 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum3 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum3 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum3 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum3 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum3 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum3 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum3 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum3 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum3 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum3 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum3 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum3 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum3 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum3 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum3 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val3}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg2 + 1, enum3, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/tcp@0.2.3", function="[method]tcp-socket.set-send-buffer-size"][Instruction::Return]', {
+      funcName: '[method]tcp-socket.set-send-buffer-size',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_116_metadata = {
+    qualifiedImportFn: 'wasi:sockets/ip-name-lookup@0.2.3#resolve-addresses',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline136(arg0, arg1, arg2, arg3) {
+    var handle1 = arg0;
+    var rep2 = handleTable18[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable8.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(Network.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    var ptr3 = arg1;
+    var len3 = arg2;
+    var result3 = TEXT_DECODER_UTF8.decode(new Uint8Array(memory0.buffer, ptr3, len3));
+    _debugLog('[iface="wasi:sockets/ip-name-lookup@0.2.3", function="resolve-addresses"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = resolveAddresses?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'resolveAddresses',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  resolveAddresses(rsc0, result3)};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 0, true);
+        if (!(e instanceof ResolveAddressStream)) {
+          throw new TypeError('Resource error: Not a valid "ResolveAddressStream" resource.');
+        }
+        var handle4 = e[symbolRscHandle];
+        if (!handle4) {
+          const rep = e[symbolRscRep] || ++captureCnt13;
+          captureTable13.set(rep, e);
+          handle4 = rscTableCreateOwn(handleTable25, rep);
+        }
+        dataView(memory0).setInt32(arg3 + 4, handle4, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg3 + 0, 1, true);
+        var val5 = e;
+        let enum5;
+        switch (val5) {
+          case 'unknown': {
+            enum5 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum5 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum5 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum5 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum5 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum5 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum5 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum5 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum5 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum5 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum5 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum5 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum5 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum5 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum5 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum5 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum5 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum5 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum5 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum5 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum5 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val5}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg3 + 4, enum5, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/ip-name-lookup@0.2.3", function="resolve-addresses"][Instruction::Return]', {
+      funcName: 'resolve-addresses',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_117_metadata = {
+    qualifiedImportFn: 'wasi:sockets/ip-name-lookup@0.2.3#[method]resolve-address-stream.resolve-next-address',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline137(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable25[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable13.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(ResolveAddressStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:sockets/ip-name-lookup@0.2.3", function="[method]resolve-address-stream.resolve-next-address"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.resolveNextAddress?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'resolveNextAddress',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.resolveNextAddress()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var variant6 = e;
+        if (variant6 === null || variant6=== undefined) {
+          dataView(memory0).setInt8(arg1 + 2, 0, true);
+        } else {
+          const e = variant6;
+          dataView(memory0).setInt8(arg1 + 2, 1, true);
+          var variant5 = e;
+          switch (variant5.tag) {
+            case 'ipv4': {
+              const e = variant5.val;
+              dataView(memory0).setInt8(arg1 + 4, 0, true);
+              var [tuple3_0, tuple3_1, tuple3_2, tuple3_3] = e;
+              dataView(memory0).setInt8(arg1 + 6, toUint8(tuple3_0), true);
+              dataView(memory0).setInt8(arg1 + 7, toUint8(tuple3_1), true);
+              dataView(memory0).setInt8(arg1 + 8, toUint8(tuple3_2), true);
+              dataView(memory0).setInt8(arg1 + 9, toUint8(tuple3_3), true);
+              break;
+            }
+            case 'ipv6': {
+              const e = variant5.val;
+              dataView(memory0).setInt8(arg1 + 4, 1, true);
+              var [tuple4_0, tuple4_1, tuple4_2, tuple4_3, tuple4_4, tuple4_5, tuple4_6, tuple4_7] = e;
+              dataView(memory0).setInt16(arg1 + 6, toUint16(tuple4_0), true);
+              dataView(memory0).setInt16(arg1 + 8, toUint16(tuple4_1), true);
+              dataView(memory0).setInt16(arg1 + 10, toUint16(tuple4_2), true);
+              dataView(memory0).setInt16(arg1 + 12, toUint16(tuple4_3), true);
+              dataView(memory0).setInt16(arg1 + 14, toUint16(tuple4_4), true);
+              dataView(memory0).setInt16(arg1 + 16, toUint16(tuple4_5), true);
+              dataView(memory0).setInt16(arg1 + 18, toUint16(tuple4_6), true);
+              dataView(memory0).setInt16(arg1 + 20, toUint16(tuple4_7), true);
+              break;
+            }
+            default: {
+              throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant5.tag)}\` (received \`${variant5}\`) specified for \`IpAddress\``);
+            }
+          }
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'unknown': {
+            enum7 = 0;
+            break;
+          }
+          case 'access-denied': {
+            enum7 = 1;
+            break;
+          }
+          case 'not-supported': {
+            enum7 = 2;
+            break;
+          }
+          case 'invalid-argument': {
+            enum7 = 3;
+            break;
+          }
+          case 'out-of-memory': {
+            enum7 = 4;
+            break;
+          }
+          case 'timeout': {
+            enum7 = 5;
+            break;
+          }
+          case 'concurrency-conflict': {
+            enum7 = 6;
+            break;
+          }
+          case 'not-in-progress': {
+            enum7 = 7;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 8;
+            break;
+          }
+          case 'invalid-state': {
+            enum7 = 9;
+            break;
+          }
+          case 'new-socket-limit': {
+            enum7 = 10;
+            break;
+          }
+          case 'address-not-bindable': {
+            enum7 = 11;
+            break;
+          }
+          case 'address-in-use': {
+            enum7 = 12;
+            break;
+          }
+          case 'remote-unreachable': {
+            enum7 = 13;
+            break;
+          }
+          case 'connection-refused': {
+            enum7 = 14;
+            break;
+          }
+          case 'connection-reset': {
+            enum7 = 15;
+            break;
+          }
+          case 'connection-aborted': {
+            enum7 = 16;
+            break;
+          }
+          case 'datagram-too-large': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-unresolvable': {
+            enum7 = 18;
+            break;
+          }
+          case 'temporary-resolver-failure': {
+            enum7 = 19;
+            break;
+          }
+          case 'permanent-resolver-failure': {
+            enum7 = 20;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 2, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:sockets/ip-name-lookup@0.2.3", function="[method]resolve-address-stream.resolve-next-address"][Instruction::Return]', {
+      funcName: '[method]resolve-address-stream.resolve-next-address',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_118_metadata = {
+    qualifiedImportFn: 'wasi:cli/environment@0.2.3#get-arguments',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline138(arg0) {
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-arguments"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getArguments?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getArguments',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getArguments();
+    endCurrentTask(3);
+    var vec1 = ret;
+    var len1 = vec1.length;
+    var result1 = realloc1(0, 0, 4, len1 * 8);
+    for (let i = 0; i < vec1.length; i++) {
+      const e = vec1[i];
+      const base = result1 + i * 8;
+      var encodeRes = _utf8AllocateAndEncode(e, realloc1, memory0);
+      var ptr0= encodeRes.ptr;
+      var len0 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 4, len0, true);
+      dataView(memory0).setUint32(base + 0, ptr0, true);
+    }
+    dataView(memory0).setUint32(arg0 + 4, len1, true);
+    dataView(memory0).setUint32(arg0 + 0, result1, true);
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-arguments"][Instruction::Return]', {
+      funcName: 'get-arguments',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_119_metadata = {
+    qualifiedImportFn: 'wasi:cli/environment@0.2.3#get-environment',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline139(arg0) {
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-environment"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getEnvironment?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getEnvironment',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getEnvironment();
+    endCurrentTask(3);
+    var vec3 = ret;
+    var len3 = vec3.length;
+    var result3 = realloc1(0, 0, 4, len3 * 16);
+    for (let i = 0; i < vec3.length; i++) {
+      const e = vec3[i];
+      const base = result3 + i * 16;var [tuple0_0, tuple0_1] = e;
+      
+      var encodeRes = _utf8AllocateAndEncode(tuple0_0, realloc1, memory0);
+      var ptr1= encodeRes.ptr;
+      var len1 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 4, len1, true);
+      dataView(memory0).setUint32(base + 0, ptr1, true);
+      
+      var encodeRes = _utf8AllocateAndEncode(tuple0_1, realloc1, memory0);
+      var ptr2= encodeRes.ptr;
+      var len2 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 12, len2, true);
+      dataView(memory0).setUint32(base + 8, ptr2, true);
+    }
+    dataView(memory0).setUint32(arg0 + 4, len3, true);
+    dataView(memory0).setUint32(arg0 + 0, result3, true);
+    _debugLog('[iface="wasi:cli/environment@0.2.3", function="get-environment"][Instruction::Return]', {
+      funcName: 'get-environment',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_120_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/types@0.2.3#[method]directory-entry-stream.read-directory-entry',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline140(arg0, arg1) {
+    var handle1 = arg0;
+    var rep2 = handleTable21[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable7.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(DirectoryEntryStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]directory-entry-stream.read-directory-entry"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.readDirectoryEntry?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'readDirectoryEntry',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.readDirectoryEntry()};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant8 = ret;
+    switch (variant8.tag) {
+      case 'ok': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 0, true);
+        var variant6 = e;
+        if (variant6 === null || variant6=== undefined) {
+          dataView(memory0).setInt8(arg1 + 4, 0, true);
+        } else {
+          const e = variant6;
+          dataView(memory0).setInt8(arg1 + 4, 1, true);
+          var {type: v3_0, name: v3_1 } = e;
+          var val4 = v3_0;
+          let enum4;
+          switch (val4) {
+            case 'unknown': {
+              enum4 = 0;
+              break;
+            }
+            case 'block-device': {
+              enum4 = 1;
+              break;
+            }
+            case 'character-device': {
+              enum4 = 2;
+              break;
+            }
+            case 'directory': {
+              enum4 = 3;
+              break;
+            }
+            case 'fifo': {
+              enum4 = 4;
+              break;
+            }
+            case 'symbolic-link': {
+              enum4 = 5;
+              break;
+            }
+            case 'regular-file': {
+              enum4 = 6;
+              break;
+            }
+            case 'socket': {
+              enum4 = 7;
+              break;
+            }
+            default: {
+              if ((v3_0) instanceof Error) {
+                console.error(v3_0);
+              }
+              
+              throw new TypeError(`"${val4}" is not one of the cases of descriptor-type`);
+            }
+          }
+          dataView(memory0).setInt8(arg1 + 8, enum4, true);
+          
+          var encodeRes = _utf8AllocateAndEncode(v3_1, realloc1, memory0);
+          var ptr5= encodeRes.ptr;
+          var len5 = encodeRes.len;
+          
+          dataView(memory0).setUint32(arg1 + 16, len5, true);
+          dataView(memory0).setUint32(arg1 + 12, ptr5, true);
+        }
+        break;
+      }
+      case 'err': {
+        const e = variant8.val;
+        dataView(memory0).setInt8(arg1 + 0, 1, true);
+        var val7 = e;
+        let enum7;
+        switch (val7) {
+          case 'access': {
+            enum7 = 0;
+            break;
+          }
+          case 'would-block': {
+            enum7 = 1;
+            break;
+          }
+          case 'already': {
+            enum7 = 2;
+            break;
+          }
+          case 'bad-descriptor': {
+            enum7 = 3;
+            break;
+          }
+          case 'busy': {
+            enum7 = 4;
+            break;
+          }
+          case 'deadlock': {
+            enum7 = 5;
+            break;
+          }
+          case 'quota': {
+            enum7 = 6;
+            break;
+          }
+          case 'exist': {
+            enum7 = 7;
+            break;
+          }
+          case 'file-too-large': {
+            enum7 = 8;
+            break;
+          }
+          case 'illegal-byte-sequence': {
+            enum7 = 9;
+            break;
+          }
+          case 'in-progress': {
+            enum7 = 10;
+            break;
+          }
+          case 'interrupted': {
+            enum7 = 11;
+            break;
+          }
+          case 'invalid': {
+            enum7 = 12;
+            break;
+          }
+          case 'io': {
+            enum7 = 13;
+            break;
+          }
+          case 'is-directory': {
+            enum7 = 14;
+            break;
+          }
+          case 'loop': {
+            enum7 = 15;
+            break;
+          }
+          case 'too-many-links': {
+            enum7 = 16;
+            break;
+          }
+          case 'message-size': {
+            enum7 = 17;
+            break;
+          }
+          case 'name-too-long': {
+            enum7 = 18;
+            break;
+          }
+          case 'no-device': {
+            enum7 = 19;
+            break;
+          }
+          case 'no-entry': {
+            enum7 = 20;
+            break;
+          }
+          case 'no-lock': {
+            enum7 = 21;
+            break;
+          }
+          case 'insufficient-memory': {
+            enum7 = 22;
+            break;
+          }
+          case 'insufficient-space': {
+            enum7 = 23;
+            break;
+          }
+          case 'not-directory': {
+            enum7 = 24;
+            break;
+          }
+          case 'not-empty': {
+            enum7 = 25;
+            break;
+          }
+          case 'not-recoverable': {
+            enum7 = 26;
+            break;
+          }
+          case 'unsupported': {
+            enum7 = 27;
+            break;
+          }
+          case 'no-tty': {
+            enum7 = 28;
+            break;
+          }
+          case 'no-such-device': {
+            enum7 = 29;
+            break;
+          }
+          case 'overflow': {
+            enum7 = 30;
+            break;
+          }
+          case 'not-permitted': {
+            enum7 = 31;
+            break;
+          }
+          case 'pipe': {
+            enum7 = 32;
+            break;
+          }
+          case 'read-only': {
+            enum7 = 33;
+            break;
+          }
+          case 'invalid-seek': {
+            enum7 = 34;
+            break;
+          }
+          case 'text-file-busy': {
+            enum7 = 35;
+            break;
+          }
+          case 'cross-device': {
+            enum7 = 36;
+            break;
+          }
+          default: {
+            if ((e) instanceof Error) {
+              console.error(e);
+            }
+            
+            throw new TypeError(`"${val7}" is not one of the cases of error-code`);
+          }
+        }
+        dataView(memory0).setInt8(arg1 + 4, enum7, true);
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:filesystem/types@0.2.3", function="[method]directory-entry-stream.read-directory-entry"][Instruction::Return]', {
+      funcName: '[method]directory-entry-stream.read-directory-entry',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_121_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]input-stream.read',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline141(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable15[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable2.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.read"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.read?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'read',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.read(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        var val3 = e;
+        var len3 = val3.byteLength;
+        var ptr3 = realloc1(0, 0, 1, len3 * 1);
+        
+        let valData3;
+        const valLenBytes3 = len3 * 1;
+        if (Array.isArray(val3)) {
+          // Regular array likely containing numbers, write values to memory
+          let offset = 0;
+          const dv3 = new DataView(memory0.buffer);
+          for (const v of val3) {
+            dv3.setUint8(ptr3+ offset, v, true);
+            offset += 1;
+          }
+        } else {
+          // TypedArray / ArrayBuffer-like, direct copy
+          valData3 = new Uint8Array(val3.buffer || val3, val3.byteOffset, valLenBytes3);
+          const out3 = new Uint8Array(memory0.buffer, ptr3,valLenBytes3);
+          out3.set(valData3);
+        }
+        
+        dataView(memory0).setUint32(arg2 + 8, len3, true);
+        dataView(memory0).setUint32(arg2 + 4, ptr3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant5 = e;
+        switch (variant5.tag) {
+          case 'last-operation-failed': {
+            const e = variant5.val;
+            dataView(memory0).setInt8(arg2 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle4 = e[symbolRscHandle];
+            if (!handle4) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle4 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 8, handle4, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant5.tag)}\` (received \`${variant5}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.read"][Instruction::Return]', {
+      funcName: '[method]input-stream.read',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_122_metadata = {
+    qualifiedImportFn: 'wasi:io/streams@0.2.3#[method]input-stream.blocking-read',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline142(arg0, arg1, arg2) {
+    var handle1 = arg0;
+    var rep2 = handleTable15[(handle1 << 1) + 1] & ~T_FLAG;
+    var rsc0 = captureTable2.get(rep2);
+    if (!rsc0) {
+      rsc0 = Object.create(InputStream.prototype);
+      Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
+      Object.defineProperty(rsc0, symbolRscRep, { writable: true, value: rep2});
+    }
+    curResourceBorrows.push(rsc0);
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.blocking-read"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = rsc0.blockingRead?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'blockingRead',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'result-catch-handler',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    
+    let ret;
+    try {
+      ret = { tag: 'ok', val:  rsc0.blockingRead(BigInt.asUintN(64, arg1))};
+    } catch (e) {
+      ret = { tag: 'err', val: getErrorPayload(e) };
+    }
+    
+    for (const rsc of curResourceBorrows) {
+      rsc[symbolRscHandle] = undefined;
+    }
+    curResourceBorrows = [];
+    endCurrentTask(3);
+    var variant6 = ret;
+    switch (variant6.tag) {
+      case 'ok': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 0, true);
+        var val3 = e;
+        var len3 = val3.byteLength;
+        var ptr3 = realloc1(0, 0, 1, len3 * 1);
+        
+        let valData3;
+        const valLenBytes3 = len3 * 1;
+        if (Array.isArray(val3)) {
+          // Regular array likely containing numbers, write values to memory
+          let offset = 0;
+          const dv3 = new DataView(memory0.buffer);
+          for (const v of val3) {
+            dv3.setUint8(ptr3+ offset, v, true);
+            offset += 1;
+          }
+        } else {
+          // TypedArray / ArrayBuffer-like, direct copy
+          valData3 = new Uint8Array(val3.buffer || val3, val3.byteOffset, valLenBytes3);
+          const out3 = new Uint8Array(memory0.buffer, ptr3,valLenBytes3);
+          out3.set(valData3);
+        }
+        
+        dataView(memory0).setUint32(arg2 + 8, len3, true);
+        dataView(memory0).setUint32(arg2 + 4, ptr3, true);
+        break;
+      }
+      case 'err': {
+        const e = variant6.val;
+        dataView(memory0).setInt8(arg2 + 0, 1, true);
+        var variant5 = e;
+        switch (variant5.tag) {
+          case 'last-operation-failed': {
+            const e = variant5.val;
+            dataView(memory0).setInt8(arg2 + 4, 0, true);
+            if (!(e instanceof Error$1)) {
+              throw new TypeError('Resource error: Not a valid "Error" resource.');
+            }
+            var handle4 = e[symbolRscHandle];
+            if (!handle4) {
+              const rep = e[symbolRscRep] || ++captureCnt0;
+              captureTable0.set(rep, e);
+              handle4 = rscTableCreateOwn(handleTable19, rep);
+            }
+            dataView(memory0).setInt32(arg2 + 8, handle4, true);
+            break;
+          }
+          case 'closed': {
+            dataView(memory0).setInt8(arg2 + 4, 1, true);
+            break;
+          }
+          default: {
+            throw new TypeError(`invalid variant tag value \`${JSON.stringify(variant5.tag)}\` (received \`${variant5}\`) specified for \`StreamError\``);
+          }
+        }
+        break;
+      }
+      default: {
+        throw new TypeError('invalid variant specified for result');
+      }
+    }
+    _debugLog('[iface="wasi:io/streams@0.2.3", function="[method]input-stream.blocking-read"][Instruction::Return]', {
+      funcName: '[method]input-stream.blocking-read',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  
+  let lowered_import_123_metadata = {
+    qualifiedImportFn: 'wasi:filesystem/preopens@0.2.3#get-directories',
+    moduleIdx: null,
+  };
+  
+  
+  function trampoline143(arg0) {
+    _debugLog('[iface="wasi:filesystem/preopens@0.2.3", function="get-directories"] [Instruction::CallInterface] (sync, @ enter)');
+    let hostProvided = false;
+    hostProvided = getDirectories?._isHostProvided;
+    
+    let parentTask;
+    let task;
+    let subtask;
+    
+    const createTask = () => {
+      const results = createNewCurrentTask({
+        componentIdx: 3,
+        isAsync: false,
+        entryFnName: 'getDirectories',
+        getCallbackFn: () => null,
+        callbackFnName: 'null',
+        errHandling: 'none',
+        callingWasmExport: false,
+      });
+      task = results[0];
+    };
+    
+    taskCreation: {
+      parentTask = getCurrentTask(3)?.task;
+      if (!parentTask) {
+        createTask();
+        break taskCreation;
+      }
+      
+      createTask();
+      
+      const isHostAsyncImport = hostProvided && false;
+      if (isHostAsyncImport) {
+        subtask = parentTask.getLatestSubtask();
+        if (!subtask) {
+          throw new Error("Missing subtask for host import, has the import been lowered? (ensure asyncImports are set properly)");
+        }
+        subtask.setChildTask(task);
+        task.setParentSubtask(subtask);
+      }
+    }
+    
+    let ret =  getDirectories();
+    endCurrentTask(3);
+    var vec3 = ret;
+    var len3 = vec3.length;
+    var result3 = realloc1(0, 0, 4, len3 * 12);
+    for (let i = 0; i < vec3.length; i++) {
+      const e = vec3[i];
+      const base = result3 + i * 12;var [tuple0_0, tuple0_1] = e;
+      if (!(tuple0_0 instanceof Descriptor)) {
+        throw new TypeError('Resource error: Not a valid "Descriptor" resource.');
+      }
+      var handle1 = tuple0_0[symbolRscHandle];
+      if (!handle1) {
+        const rep = tuple0_0[symbolRscRep] || ++captureCnt6;
+        captureTable6.set(rep, tuple0_0);
+        handle1 = rscTableCreateOwn(handleTable20, rep);
+      }
+      dataView(memory0).setInt32(base + 0, handle1, true);
+      
+      var encodeRes = _utf8AllocateAndEncode(tuple0_1, realloc1, memory0);
+      var ptr2= encodeRes.ptr;
+      var len2 = encodeRes.len;
+      
+      dataView(memory0).setUint32(base + 8, len2, true);
+      dataView(memory0).setUint32(base + 4, ptr2, true);
+    }
+    dataView(memory0).setUint32(arg0 + 4, len3, true);
+    dataView(memory0).setUint32(arg0 + 0, result3, true);
+    _debugLog('[iface="wasi:filesystem/preopens@0.2.3", function="get-directories"][Instruction::Return]', {
+      funcName: 'get-directories',
+      paramCount: 0,
+      async: false,
+      postReturn: false
+    });
+  }
+  
+  let exports5;
   let postReturn0;
   let postReturn1;
   let postReturn2;
-  let memory0;
   let postReturn3;
   let postReturn4;
   let postReturn5;
@@ -1867,6 +24279,58 @@ let gen = (function* _initGenerator () {
   let postReturn13;
   let postReturn14;
   let postReturn15;
+  function trampoline0(handle) {
+    const handleEntry = rscTableRemove(handleTable14, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable1.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable1.delete(handleEntry.rep);
+      } else if (Pollable[symbolCabiDispose]) {
+        Pollable[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline1(handle) {
+    const handleEntry = rscTableRemove(handleTable15, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable2.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable2.delete(handleEntry.rep);
+      } else if (InputStream[symbolCabiDispose]) {
+        InputStream[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline2(handle) {
+    const handleEntry = rscTableRemove(handleTable16, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable3.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable3.delete(handleEntry.rep);
+      } else if (OutputStream[symbolCabiDispose]) {
+        OutputStream[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline3(handle) {
+    const handleEntry = rscTableRemove(handleTable17, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable12.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable12.delete(handleEntry.rep);
+      } else if (TcpSocket[symbolCabiDispose]) {
+        TcpSocket[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
   
   GlobalComponentAsyncLowers.define({
     componentIdx: lowered_import_0_metadata.moduleIdx,
@@ -1874,12 +24338,12 @@ let gen = (function* _initGenerator () {
     fn: _lowerImport.bind(
     null,
     {
-      trampolineIdx: 0,
+      trampolineIdx: 4,
       componentIdx: 3,
       isAsync: false,
-      paramLiftFns: [_liftFlatU32],
+      paramLiftFns: [_liftFlatBorrow.bind(null, 14)],
       metadata: lowered_import_0_metadata,
-      resultLowerFns: [_lowerFlatBool],
+      resultLowerFns: [],
       getCallbackFn: () => null,
       getPostReturnFn: () => null,
       isCancellable: false,
@@ -1897,11 +24361,195 @@ let gen = (function* _initGenerator () {
     fn: _lowerImport.bind(
     null,
     {
-      trampolineIdx: 1,
+      trampolineIdx: 5,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 15)],
+      metadata: lowered_import_1_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_2_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_2_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 6,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16)],
+      metadata: lowered_import_2_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_3_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_3_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 7,
       componentIdx: 3,
       isAsync: false,
       paramLiftFns: [],
-      metadata: lowered_import_1_metadata,
+      metadata: lowered_import_3_metadata,
+      resultLowerFns: [_lowerFlatU64],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_4_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_4_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 8,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatU64],
+      metadata: lowered_import_4_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_5_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_5_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 9,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatU64],
+      metadata: lowered_import_5_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_6_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_6_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 10,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_6_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 18)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_7_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_7_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 11,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_7_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_8_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_8_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 12,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_8_metadata,
+      resultLowerFns: [_lowerFlatU64],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_9_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_9_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 13,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatResult([['ok', null, null],['error', null, null],])],
+      metadata: lowered_import_9_metadata,
       resultLowerFns: [],
       getCallbackFn: () => null,
       getPostReturnFn: () => null,
@@ -1913,40 +24561,2793 @@ let gen = (function* _initGenerator () {
     ),
   });
   
-  const handleTable0 = [T_FLAG, 0];
-  const finalizationRegistry0 = finalizationRegistryCreate((handle) => {
-    const { rep } = rscTableRemove(handleTable0, handle);
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_10_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_10_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 14,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 14)],
+      metadata: lowered_import_10_metadata,
+      resultLowerFns: [_lowerFlatBool],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
   });
   
-  handleTables[0] = handleTable0;
-  const trampoline2 = rscTableCreateOwn.bind(null, handleTable0);
-  function trampoline3(handle) {
-    return handleTable0[(handle << 1) + 1] & ~T_FLAG;
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_11_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_11_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 15,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_11_metadata,
+      resultLowerFns: [_lowerFlatBool],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_12_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_12_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 16,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_12_metadata,
+      resultLowerFns: [_lowerFlatEnum.bind(null, 4)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_13_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_13_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 17,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_13_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_14_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_14_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 18,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 23)],
+      metadata: lowered_import_14_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_15_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_15_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 19,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 24)],
+      metadata: lowered_import_15_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_16_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_16_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 20,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_16_metadata,
+      resultLowerFns: [_lowerFlatBool],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_17_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_17_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 21,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_17_metadata,
+      resultLowerFns: [_lowerFlatEnum.bind(null, 4)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_18_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_18_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 22,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 25)],
+      metadata: lowered_import_18_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 14)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_19_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_19_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 23,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatU32],
+      metadata: lowered_import_19_metadata,
+      resultLowerFns: [_lowerFlatBool],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_20_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_20_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 24,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_20_metadata,
+      resultLowerFns: [],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  const handleTable26 = [T_FLAG, 0];
+  const finalizationRegistry26 = finalizationRegistryCreate((handle) => {
+    const { rep } = rscTableRemove(handleTable26, handle);
+  });
+  
+  handleTables[26] = handleTable26;
+  const trampoline25 = rscTableCreateOwn.bind(null, handleTable26);
+  function trampoline26(handle) {
+    return handleTable26[(handle << 1) + 1] & ~T_FLAG;
   }
-  function trampoline4(handle) {
-    const handleEntry = rscTableRemove(handleTable0, handle);
+  function trampoline27(handle) {
+    const handleEntry = rscTableRemove(handleTable26, handle);
     if (handleEntry.own) {
       
     }
   }
-  const handleTable1 = [T_FLAG, 0];
-  const finalizationRegistry1 = finalizationRegistryCreate((handle) => {
-    const { rep } = rscTableRemove(handleTable1, handle);
+  const handleTable27 = [T_FLAG, 0];
+  const finalizationRegistry27 = finalizationRegistryCreate((handle) => {
+    const { rep } = rscTableRemove(handleTable27, handle);
   });
   
-  handleTables[1] = handleTable1;
-  const trampoline5 = rscTableCreateOwn.bind(null, handleTable1);
-  function trampoline6(handle) {
-    return handleTable1[(handle << 1) + 1] & ~T_FLAG;
+  handleTables[27] = handleTable27;
+  const trampoline28 = rscTableCreateOwn.bind(null, handleTable27);
+  function trampoline29(handle) {
+    return handleTable27[(handle << 1) + 1] & ~T_FLAG;
   }
-  function trampoline7(handle) {
-    const handleEntry = rscTableRemove(handleTable1, handle);
+  function trampoline30(handle) {
+    const handleEntry = rscTableRemove(handleTable27, handle);
     if (handleEntry.own) {
       
     }
   }
+  function trampoline31(handle) {
+    const handleEntry = rscTableRemove(handleTable19, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable0.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable0.delete(handleEntry.rep);
+      } else if (Error$1[symbolCabiDispose]) {
+        Error$1[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline32(handle) {
+    const handleEntry = rscTableRemove(handleTable20, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable6.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable6.delete(handleEntry.rep);
+      } else if (Descriptor[symbolCabiDispose]) {
+        Descriptor[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline33(handle) {
+    const handleEntry = rscTableRemove(handleTable21, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable7.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable7.delete(handleEntry.rep);
+      } else if (DirectoryEntryStream[symbolCabiDispose]) {
+        DirectoryEntryStream[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline34(handle) {
+    const handleEntry = rscTableRemove(handleTable18, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable8.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable8.delete(handleEntry.rep);
+      } else if (Network[symbolCabiDispose]) {
+        Network[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline35(handle) {
+    const handleEntry = rscTableRemove(handleTable22, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable9.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable9.delete(handleEntry.rep);
+      } else if (UdpSocket[symbolCabiDispose]) {
+        UdpSocket[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline36(handle) {
+    const handleEntry = rscTableRemove(handleTable23, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable10.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable10.delete(handleEntry.rep);
+      } else if (IncomingDatagramStream[symbolCabiDispose]) {
+        IncomingDatagramStream[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline37(handle) {
+    const handleEntry = rscTableRemove(handleTable24, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable11.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable11.delete(handleEntry.rep);
+      } else if (OutgoingDatagramStream[symbolCabiDispose]) {
+        OutgoingDatagramStream[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline38(handle) {
+    const handleEntry = rscTableRemove(handleTable25, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable13.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable13.delete(handleEntry.rep);
+      } else if (ResolveAddressStream[symbolCabiDispose]) {
+        ResolveAddressStream[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline39(handle) {
+    const handleEntry = rscTableRemove(handleTable28, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable4.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable4.delete(handleEntry.rep);
+      } else if (TerminalInput[symbolCabiDispose]) {
+        TerminalInput[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  function trampoline40(handle) {
+    const handleEntry = rscTableRemove(handleTable29, handle);
+    if (handleEntry.own) {
+      
+      const rsc = captureTable5.get(handleEntry.rep);
+      if (rsc) {
+        if (rsc[symbolDispose]) rsc[symbolDispose]();
+        captureTable5.delete(handleEntry.rep);
+      } else if (TerminalOutput[symbolCabiDispose]) {
+        TerminalOutput[symbolCabiDispose](handleEntry.rep);
+      }
+    }
+  }
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_21_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_21_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 41,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_21_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 16)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_22_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_22_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 42,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_22_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 15)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_23_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_23_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 43,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_23_metadata,
+      resultLowerFns: [_lowerFlatOwn.bind(null, 16)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: null,
+      getMemoryFn: () => null,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_24_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_24_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 44,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatList.bind(null, 8)],
+      metadata: lowered_import_24_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatU32, typeIdx: 3 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_25_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_25_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 45,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_25_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatList({ elemLowerFn: _lowerFlatU8, typeIdx: 4 }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_26_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_26_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 46,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_26_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatList({ elemLowerFn: _lowerFlatU8, typeIdx: 4 }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_27_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_27_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 47,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16)],
+      metadata: lowered_import_27_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_28_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_28_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 48,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16),_liftFlatList.bind(null, 4)],
+      metadata: lowered_import_28_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_29_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_29_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 49,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16)],
+      metadata: lowered_import_29_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_30_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_30_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 50,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatBorrow.bind(null, 18),_liftFlatVariant([['ipv4', _liftFlatRecord([['port', _liftFlatU16, 6],['address', _liftFlatTuple.bind(null, 60), 6],]), 6],['ipv6', _liftFlatRecord([['port', _liftFlatU16, 28],['flow-info', _liftFlatU32, 28],['address', _liftFlatTuple.bind(null, 61), 28],['scope-id', _liftFlatU32, 28],]), 28],])],
+      metadata: lowered_import_30_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_31_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_31_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 51,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_31_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatTuple.bind(null, 121), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_32_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_32_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 52,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatEnum.bind(null, 5)],
+      metadata: lowered_import_32_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_33_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_33_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 53,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_33_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatStringUTF8, typeIdx: 1 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_34_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_34_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 54,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatEnum.bind(null, 4)],
+      metadata: lowered_import_34_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 17), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_35_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_35_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 55,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatU64],
+      metadata: lowered_import_35_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatU8, typeIdx: 4 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_36_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_36_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 56,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_36_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatTuple.bind(null, 3), typeIdx: 0 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_37_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_37_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 57,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_37_metadata,
+      resultLowerFns: [_lowerFlatOption.bind(null, 0)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_38_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_38_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 58,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 19)],
+      metadata: lowered_import_38_metadata,
+      resultLowerFns: [_lowerFlatStringUTF8],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_39_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_39_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 59,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_39_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_40_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_40_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 60,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_40_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_41_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_41_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 61,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16),_liftFlatList.bind(null, 4)],
+      metadata: lowered_import_41_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_42_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_42_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 62,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16)],
+      metadata: lowered_import_42_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_43_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_43_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 63,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16),_liftFlatU64],
+      metadata: lowered_import_43_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_44_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_44_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 64,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16),_liftFlatU64],
+      metadata: lowered_import_44_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_45_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_45_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 65,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16),_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_45_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_46_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_46_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 66,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 16),_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_46_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_47_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_47_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 67,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_47_metadata,
+      resultLowerFns: [_lowerFlatOption.bind(null, 8)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_48_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_48_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 68,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_48_metadata,
+      resultLowerFns: [_lowerFlatOption.bind(null, 9)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_49_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_49_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 69,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_49_metadata,
+      resultLowerFns: [_lowerFlatOption.bind(null, 9)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_50_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_50_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 70,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 19)],
+      metadata: lowered_import_50_metadata,
+      resultLowerFns: [_lowerFlatOption.bind(null, 5)],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_51_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_51_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 71,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatU64],
+      metadata: lowered_import_51_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 15), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_52_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_52_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 72,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatU64],
+      metadata: lowered_import_52_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 16), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_53_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_53_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 73,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_53_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 16), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_54_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_54_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 74,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatU64,_liftFlatU64,_liftFlatEnum.bind(null, 1)],
+      metadata: lowered_import_54_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_55_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_55_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 75,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_55_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_56_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_56_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 76,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_56_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatFlags.bind(null, 0), align32: 1 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_57_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_57_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 77,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_57_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatEnum.bind(null, 2), align32: 1 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_58_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_58_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 78,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatU64],
+      metadata: lowered_import_58_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_59_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_59_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 79,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatVariant([['no-change', null, null],['now', null, null],['timestamp', _liftFlatRecord([['seconds', _liftFlatU64, 16],['nanoseconds', _liftFlatU32, 16],]), 16],]),_liftFlatVariant([['no-change', null, null],['now', null, null],['timestamp', _liftFlatRecord([['seconds', _liftFlatU64, 16],['nanoseconds', _liftFlatU32, 16],]), 16],])],
+      metadata: lowered_import_59_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_60_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_60_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 80,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatU64,_liftFlatU64],
+      metadata: lowered_import_60_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatTuple.bind(null, 37), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_61_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_61_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 81,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatList.bind(null, 4),_liftFlatU64],
+      metadata: lowered_import_61_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_62_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_62_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 82,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_62_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 21), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_63_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_63_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 83,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_63_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_64_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_64_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 84,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8],
+      metadata: lowered_import_64_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_65_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_65_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 85,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_65_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatRecord([{ field: 'type', lowerFn: _lowerFlatEnum.bind(null, 2), align32: 8 },{ field: 'link-count', lowerFn: _lowerFlatU64, align32: 8 },{ field: 'size', lowerFn: _lowerFlatU64, align32: 8 },{ field: 'data-access-timestamp', lowerFn: _lowerFlatOption.bind(null, 3), align32: 8 },{ field: 'data-modification-timestamp', lowerFn: _lowerFlatOption.bind(null, 3), align32: 8 },{ field: 'status-change-timestamp', lowerFn: _lowerFlatOption.bind(null, 3), align32: 8 },]), align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_66_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_66_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 86,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatFlags.bind(null, 1),_liftFlatStringUTF8],
+      metadata: lowered_import_66_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatRecord([{ field: 'type', lowerFn: _lowerFlatEnum.bind(null, 2), align32: 8 },{ field: 'link-count', lowerFn: _lowerFlatU64, align32: 8 },{ field: 'size', lowerFn: _lowerFlatU64, align32: 8 },{ field: 'data-access-timestamp', lowerFn: _lowerFlatOption.bind(null, 3), align32: 8 },{ field: 'data-modification-timestamp', lowerFn: _lowerFlatOption.bind(null, 3), align32: 8 },{ field: 'status-change-timestamp', lowerFn: _lowerFlatOption.bind(null, 3), align32: 8 },]), align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_67_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_67_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 87,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatFlags.bind(null, 1),_liftFlatStringUTF8,_liftFlatVariant([['no-change', null, null],['now', null, null],['timestamp', _liftFlatRecord([['seconds', _liftFlatU64, 16],['nanoseconds', _liftFlatU32, 16],]), 16],]),_liftFlatVariant([['no-change', null, null],['now', null, null],['timestamp', _liftFlatRecord([['seconds', _liftFlatU64, 16],['nanoseconds', _liftFlatU32, 16],]), 16],])],
+      metadata: lowered_import_67_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_68_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_68_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 88,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatFlags.bind(null, 1),_liftFlatStringUTF8,_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8],
+      metadata: lowered_import_68_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_69_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_69_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 89,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatFlags.bind(null, 1),_liftFlatStringUTF8,_liftFlatFlags.bind(null, 2),_liftFlatFlags.bind(null, 0)],
+      metadata: lowered_import_69_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 20), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_70_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_70_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 90,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8],
+      metadata: lowered_import_70_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatStringUTF8, align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_71_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_71_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 91,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8],
+      metadata: lowered_import_71_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_72_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_72_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 92,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8,_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8],
+      metadata: lowered_import_72_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_73_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_73_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 93,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8,_liftFlatStringUTF8],
+      metadata: lowered_import_73_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_74_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_74_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 94,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatStringUTF8],
+      metadata: lowered_import_74_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_75_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_75_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 95,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20)],
+      metadata: lowered_import_75_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatRecord([{ field: 'lower', lowerFn: _lowerFlatU64, align32: 8 },{ field: 'upper', lowerFn: _lowerFlatU64, align32: 8 },]), align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_76_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_76_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 96,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 20),_liftFlatFlags.bind(null, 1),_liftFlatStringUTF8],
+      metadata: lowered_import_76_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatRecord([{ field: 'lower', lowerFn: _lowerFlatU64, align32: 8 },{ field: 'upper', lowerFn: _lowerFlatU64, align32: 8 },]), align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_77_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_77_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 97,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 21)],
+      metadata: lowered_import_77_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOption.bind(null, 4), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_78_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_78_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 98,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_78_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatTuple.bind(null, 148), typeIdx: 9 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_79_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_79_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 99,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22),_liftFlatBorrow.bind(null, 18),_liftFlatVariant([['ipv4', _liftFlatRecord([['port', _liftFlatU16, 6],['address', _liftFlatTuple.bind(null, 60), 6],]), 6],['ipv6', _liftFlatRecord([['port', _liftFlatU16, 28],['flow-info', _liftFlatU32, 28],['address', _liftFlatTuple.bind(null, 61), 28],['scope-id', _liftFlatU32, 28],]), 28],])],
+      metadata: lowered_import_79_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_80_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_80_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 100,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_80_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_81_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_81_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 101,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22),_liftFlatOption.bind(null, 6)],
+      metadata: lowered_import_81_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatTuple.bind(null, 151), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_82_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_82_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 102,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_82_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'ipv4', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 2 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 60), align32: 2 },]), align32: 2, },{ discriminant: 1, tag: 'ipv6', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 4 },{ field: 'flow-info', lowerFn: _lowerFlatU32, align32: 4 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 61), align32: 4 },{ field: 'scope-id', lowerFn: _lowerFlatU32, align32: 4 },]), align32: 4, },] }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_83_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_83_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 103,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_83_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'ipv4', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 2 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 60), align32: 2 },]), align32: 2, },{ discriminant: 1, tag: 'ipv6', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 4 },{ field: 'flow-info', lowerFn: _lowerFlatU32, align32: 4 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 61), align32: 4 },{ field: 'scope-id', lowerFn: _lowerFlatU32, align32: 4 },]), align32: 4, },] }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_84_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_84_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 104,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_84_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU8, align32: 1 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_85_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_85_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 105,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22),_liftFlatU8],
+      metadata: lowered_import_85_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_86_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_86_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 106,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_86_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_87_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_87_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 107,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22),_liftFlatU64],
+      metadata: lowered_import_87_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_88_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_88_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 108,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22)],
+      metadata: lowered_import_88_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_89_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_89_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 109,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 22),_liftFlatU64],
+      metadata: lowered_import_89_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_90_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_90_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 110,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 23),_liftFlatU64],
+      metadata: lowered_import_90_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatList({ elemLowerFn: _lowerFlatRecord([{ field: 'data', lowerFn: _lowerFlatList({ elemLowerFn: _lowerFlatU8, typeIdx: 4 }), align32: 4 },{ field: 'remote-address', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'ipv4', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 2 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 60), align32: 2 },]), align32: 2, },{ discriminant: 1, tag: 'ipv6', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 4 },{ field: 'flow-info', lowerFn: _lowerFlatU32, align32: 4 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 61), align32: 4 },{ field: 'scope-id', lowerFn: _lowerFlatU32, align32: 4 },]), align32: 4, },] }), align32: 4 },]), typeIdx: 6 }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc0,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_91_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_91_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 111,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 24)],
+      metadata: lowered_import_91_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_92_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_92_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 112,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 24),_liftFlatList.bind(null, 7)],
+      metadata: lowered_import_92_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_93_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_93_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 113,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatEnum.bind(null, 4)],
+      metadata: lowered_import_93_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 22), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_94_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_94_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 114,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatBorrow.bind(null, 18),_liftFlatVariant([['ipv4', _liftFlatRecord([['port', _liftFlatU16, 6],['address', _liftFlatTuple.bind(null, 60), 6],]), 6],['ipv6', _liftFlatRecord([['port', _liftFlatU16, 28],['flow-info', _liftFlatU32, 28],['address', _liftFlatTuple.bind(null, 61), 28],['scope-id', _liftFlatU32, 28],]), 28],])],
+      metadata: lowered_import_94_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_95_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_95_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 115,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_95_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_96_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_96_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 116,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_96_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_97_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_97_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 117,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_97_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_98_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_98_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 118,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_98_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatTuple.bind(null, 159), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_99_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_99_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 119,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_99_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'ipv4', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 2 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 60), align32: 2 },]), align32: 2, },{ discriminant: 1, tag: 'ipv6', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 4 },{ field: 'flow-info', lowerFn: _lowerFlatU32, align32: 4 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 61), align32: 4 },{ field: 'scope-id', lowerFn: _lowerFlatU32, align32: 4 },]), align32: 4, },] }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_100_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_100_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 120,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_100_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'ipv4', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 2 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 60), align32: 2 },]), align32: 2, },{ discriminant: 1, tag: 'ipv6', lowerFn: _lowerFlatRecord([{ field: 'port', lowerFn: _lowerFlatU16, align32: 4 },{ field: 'flow-info', lowerFn: _lowerFlatU32, align32: 4 },{ field: 'address', lowerFn: _lowerFlatTuple.bind(null, 61), align32: 4 },{ field: 'scope-id', lowerFn: _lowerFlatU32, align32: 4 },]), align32: 4, },] }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_101_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_101_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 121,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatU64],
+      metadata: lowered_import_101_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_102_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_102_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 122,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_102_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatBool, align32: 1 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_103_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_103_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 123,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatBool],
+      metadata: lowered_import_103_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_104_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_104_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 124,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_104_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_105_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_105_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 125,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatU64],
+      metadata: lowered_import_105_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_106_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_106_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 126,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_106_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_107_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_107_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 127,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatU64],
+      metadata: lowered_import_107_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_108_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_108_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 128,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_108_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU32, align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_109_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_109_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 129,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatU32],
+      metadata: lowered_import_109_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_110_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_110_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 130,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_110_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU8, align32: 1 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_111_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_111_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 131,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatU8],
+      metadata: lowered_import_111_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_112_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_112_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 132,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_112_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_113_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_113_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 133,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatU64],
+      metadata: lowered_import_113_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_114_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_114_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 134,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17)],
+      metadata: lowered_import_114_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatU64, align32: 8 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_115_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_115_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 135,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 17),_liftFlatU64],
+      metadata: lowered_import_115_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: null, align32: null },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_116_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_116_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 136,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 18),_liftFlatStringUTF8],
+      metadata: lowered_import_116_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOwn.bind(null, 25), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_117_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_117_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 137,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 25)],
+      metadata: lowered_import_117_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOption.bind(null, 7), align32: 2 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 3), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => null,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_118_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_118_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 138,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_118_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatStringUTF8, typeIdx: 1 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc1,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_119_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_119_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 139,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_119_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatTuple.bind(null, 3), typeIdx: 0 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc1,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_120_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_120_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 140,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 21)],
+      metadata: lowered_import_120_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatOption.bind(null, 4), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatEnum.bind(null, 0), align32: 1 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc1,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_121_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_121_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 141,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_121_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatList({ elemLowerFn: _lowerFlatU8, typeIdx: 4 }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc1,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_122_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_122_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 142,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [_liftFlatBorrow.bind(null, 15),_liftFlatU64],
+      metadata: lowered_import_122_metadata,
+      resultLowerFns: [_lowerFlatResult([{ discriminant: 0, tag: 'ok', lowerFn: _lowerFlatList({ elemLowerFn: _lowerFlatU8, typeIdx: 4 }), align32: 4 },{ discriminant: 1, tag: 'error', lowerFn: _lowerFlatVariant({ discriminantSizeBytes: 1, lowerMetas: [{ discriminant: 0, tag: 'last-operation-failed', lowerFn: _lowerFlatOwn.bind(null, 19), align32: 4, },{ discriminant: 1, tag: 'closed', lowerFn: null, align32: null, },] }), align32: 4 },])],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc1,
+    },
+    ),
+  });
+  
+  
+  GlobalComponentAsyncLowers.define({
+    componentIdx: lowered_import_123_metadata.moduleIdx,
+    qualifiedImportFn: lowered_import_123_metadata.qualifiedImportFn,
+    fn: _lowerImport.bind(
+    null,
+    {
+      trampolineIdx: 143,
+      componentIdx: 3,
+      isAsync: false,
+      paramLiftFns: [],
+      metadata: lowered_import_123_metadata,
+      resultLowerFns: [_lowerFlatList({ elemLowerFn: _lowerFlatTuple.bind(null, 148), typeIdx: 9 })],
+      getCallbackFn: () => null,
+      getPostReturnFn: () => null,
+      isCancellable: false,
+      memoryIdx: 0,
+      getMemoryFn: () => memory0,
+      getReallocFn: () => realloc1,
+    },
+    ),
+  });
+  
   ({ exports: exports0 } = instantiateCore(module0));
-  ({ exports: exports1 } = instantiateCore(module2, {
+  ({ exports: exports1 } = instantiateCore(module3));
+  ({ exports: exports2 } = instantiateCore(module5, {
     callee: {
       adapter0: exports0['docs:adder/add@0.1.0#add'],
       adapter1: exports0['docs:adder/add@0.1.0#sub'],
@@ -1962,43 +27363,450 @@ let gen = (function* _initGenerator () {
       adapter2: exports0['cabi_post_docs:adder/add@0.1.0#mul'],
     },
   }));
-  ({ exports: exports2 } = instantiateCore(module1, {
+  ({ exports: exports3 } = instantiateCore(module1, {
     '[export]docs:calculator/calculate@0.1.0': {
-      '[resource-drop]calc-session': trampoline4,
-      '[resource-drop]number-stream': trampoline7,
-      '[resource-new]calc-session': trampoline2,
-      '[resource-new]number-stream': trampoline5,
-      '[resource-rep]calc-session': trampoline3,
-      '[resource-rep]number-stream': trampoline6,
+      '[resource-drop]calc-session': trampoline27,
+      '[resource-drop]number-stream': trampoline30,
+      '[resource-new]calc-session': trampoline25,
+      '[resource-new]number-stream': trampoline28,
+      '[resource-rep]calc-session': trampoline26,
+      '[resource-rep]number-stream': trampoline29,
     },
     'docs:adder/add@0.1.0': {
-      add: exports1.adapter0,
-      mul: exports1.adapter2,
-      sub: exports1.adapter1,
+      add: exports2.adapter0,
+      mul: exports2.adapter2,
+      sub: exports2.adapter1,
     },
     'docs:calculator/stream-sink@0.1.0': {
-      'on-done': trampoline1,
-      'on-number': trampoline0,
+      'on-done': trampoline24,
+      'on-number': trampoline23,
+    },
+    'wasi:cli/environment@0.2.0': {
+      'get-arguments': exports1['9'],
+      'get-environment': exports1['28'],
+      'initial-cwd': exports1['29'],
+    },
+    'wasi:cli/environment@0.2.3': {
+      'get-arguments': exports1['9'],
+    },
+    'wasi:cli/exit@0.2.0': {
+      exit: trampoline13,
+    },
+    'wasi:cli/terminal-input@0.2.0': {
+      '[resource-drop]terminal-input': trampoline39,
+    },
+    'wasi:cli/terminal-output@0.2.0': {
+      '[resource-drop]terminal-output': trampoline40,
+    },
+    'wasi:cli/terminal-stderr@0.2.0': {
+      'get-terminal-stderr': exports1['41'],
+    },
+    'wasi:cli/terminal-stdin@0.2.0': {
+      'get-terminal-stdin': exports1['39'],
+    },
+    'wasi:cli/terminal-stdout@0.2.0': {
+      'get-terminal-stdout': exports1['40'],
+    },
+    'wasi:clocks/monotonic-clock@0.2.3': {
+      now: trampoline7,
+      'subscribe-duration': trampoline9,
+      'subscribe-instant': trampoline8,
+    },
+    'wasi:filesystem/preopens@0.2.0': {
+      'get-directories': exports1['70'],
+    },
+    'wasi:filesystem/types@0.2.0': {
+      '[method]descriptor.advise': exports1['46'],
+      '[method]descriptor.append-via-stream': exports1['45'],
+      '[method]descriptor.create-directory-at': exports1['56'],
+      '[method]descriptor.get-flags': exports1['48'],
+      '[method]descriptor.get-type': exports1['49'],
+      '[method]descriptor.is-same-object': trampoline15,
+      '[method]descriptor.link-at': exports1['60'],
+      '[method]descriptor.metadata-hash': exports1['67'],
+      '[method]descriptor.metadata-hash-at': exports1['68'],
+      '[method]descriptor.open-at': exports1['61'],
+      '[method]descriptor.read': exports1['52'],
+      '[method]descriptor.read-directory': exports1['54'],
+      '[method]descriptor.read-via-stream': exports1['43'],
+      '[method]descriptor.readlink-at': exports1['62'],
+      '[method]descriptor.remove-directory-at': exports1['63'],
+      '[method]descriptor.rename-at': exports1['64'],
+      '[method]descriptor.set-size': exports1['50'],
+      '[method]descriptor.set-times': exports1['51'],
+      '[method]descriptor.set-times-at': exports1['59'],
+      '[method]descriptor.stat': exports1['57'],
+      '[method]descriptor.stat-at': exports1['58'],
+      '[method]descriptor.symlink-at': exports1['65'],
+      '[method]descriptor.sync': exports1['55'],
+      '[method]descriptor.sync-data': exports1['47'],
+      '[method]descriptor.unlink-file-at': exports1['66'],
+      '[method]descriptor.write': exports1['53'],
+      '[method]descriptor.write-via-stream': exports1['44'],
+      '[method]directory-entry-stream.read-directory-entry': exports1['69'],
+      '[resource-drop]descriptor': trampoline32,
+      '[resource-drop]directory-entry-stream': trampoline33,
+      'filesystem-error-code': exports1['42'],
+    },
+    'wasi:io/error@0.2.0': {
+      '[method]error.to-debug-string': exports1['30'],
+      '[resource-drop]error': trampoline31,
+    },
+    'wasi:io/poll@0.2.0': {
+      '[method]pollable.block': trampoline4,
+      '[method]pollable.ready': trampoline14,
+      '[resource-drop]pollable': trampoline0,
+      poll: exports1['0'],
+    },
+    'wasi:io/poll@0.2.3': {
+      '[method]pollable.block': trampoline4,
+      '[resource-drop]pollable': trampoline0,
+      poll: exports1['0'],
+    },
+    'wasi:io/streams@0.2.0': {
+      '[method]input-stream.blocking-read': exports1['2'],
+      '[method]input-stream.blocking-skip': exports1['32'],
+      '[method]input-stream.read': exports1['1'],
+      '[method]input-stream.skip': exports1['31'],
+      '[method]input-stream.subscribe': trampoline5,
+      '[method]output-stream.blocking-flush': exports1['5'],
+      '[method]output-stream.blocking-splice': exports1['38'],
+      '[method]output-stream.blocking-write-and-flush': exports1['33'],
+      '[method]output-stream.blocking-write-zeroes-and-flush': exports1['36'],
+      '[method]output-stream.check-write': exports1['3'],
+      '[method]output-stream.flush': exports1['34'],
+      '[method]output-stream.splice': exports1['37'],
+      '[method]output-stream.subscribe': trampoline6,
+      '[method]output-stream.write': exports1['4'],
+      '[method]output-stream.write-zeroes': exports1['35'],
+      '[resource-drop]input-stream': trampoline1,
+      '[resource-drop]output-stream': trampoline2,
+    },
+    'wasi:io/streams@0.2.3': {
+      '[method]input-stream.blocking-read': exports1['2'],
+      '[method]input-stream.read': exports1['1'],
+      '[method]input-stream.subscribe': trampoline5,
+      '[method]output-stream.blocking-flush': exports1['5'],
+      '[method]output-stream.check-write': exports1['3'],
+      '[method]output-stream.subscribe': trampoline6,
+      '[method]output-stream.write': exports1['4'],
+      '[resource-drop]input-stream': trampoline1,
+      '[resource-drop]output-stream': trampoline2,
+    },
+    'wasi:random/random@0.2.3': {
+      'get-random-bytes': exports1['11'],
+      'get-random-u64': trampoline12,
+    },
+    'wasi:sockets/instance-network@0.2.0': {
+      'instance-network': trampoline10,
+    },
+    'wasi:sockets/instance-network@0.2.3': {
+      'instance-network': trampoline10,
+    },
+    'wasi:sockets/ip-name-lookup@0.2.0': {
+      '[method]resolve-address-stream.resolve-next-address': exports1['109'],
+      '[method]resolve-address-stream.subscribe': trampoline22,
+      '[resource-drop]resolve-address-stream': trampoline38,
+      'resolve-addresses': exports1['108'],
+    },
+    'wasi:sockets/network@0.2.0': {
+      '[resource-drop]network': trampoline34,
+    },
+    'wasi:sockets/tcp-create-socket@0.2.0': {
+      'create-tcp-socket': exports1['10'],
+    },
+    'wasi:sockets/tcp-create-socket@0.2.3': {
+      'create-tcp-socket': exports1['10'],
+    },
+    'wasi:sockets/tcp@0.2.0': {
+      '[method]tcp-socket.accept': exports1['90'],
+      '[method]tcp-socket.address-family': trampoline21,
+      '[method]tcp-socket.finish-bind': exports1['87'],
+      '[method]tcp-socket.finish-connect': exports1['7'],
+      '[method]tcp-socket.finish-listen': exports1['89'],
+      '[method]tcp-socket.hop-limit': exports1['102'],
+      '[method]tcp-socket.is-listening': trampoline20,
+      '[method]tcp-socket.keep-alive-count': exports1['100'],
+      '[method]tcp-socket.keep-alive-enabled': exports1['94'],
+      '[method]tcp-socket.keep-alive-idle-time': exports1['96'],
+      '[method]tcp-socket.keep-alive-interval': exports1['98'],
+      '[method]tcp-socket.local-address': exports1['91'],
+      '[method]tcp-socket.receive-buffer-size': exports1['104'],
+      '[method]tcp-socket.remote-address': exports1['92'],
+      '[method]tcp-socket.send-buffer-size': exports1['106'],
+      '[method]tcp-socket.set-hop-limit': exports1['103'],
+      '[method]tcp-socket.set-keep-alive-count': exports1['101'],
+      '[method]tcp-socket.set-keep-alive-enabled': exports1['95'],
+      '[method]tcp-socket.set-keep-alive-idle-time': exports1['97'],
+      '[method]tcp-socket.set-keep-alive-interval': exports1['99'],
+      '[method]tcp-socket.set-listen-backlog-size': exports1['93'],
+      '[method]tcp-socket.set-receive-buffer-size': exports1['105'],
+      '[method]tcp-socket.set-send-buffer-size': exports1['107'],
+      '[method]tcp-socket.shutdown': exports1['8'],
+      '[method]tcp-socket.start-bind': exports1['86'],
+      '[method]tcp-socket.start-connect': exports1['6'],
+      '[method]tcp-socket.start-listen': exports1['88'],
+      '[method]tcp-socket.subscribe': trampoline11,
+      '[resource-drop]tcp-socket': trampoline3,
+    },
+    'wasi:sockets/tcp@0.2.3': {
+      '[method]tcp-socket.finish-connect': exports1['7'],
+      '[method]tcp-socket.shutdown': exports1['8'],
+      '[method]tcp-socket.start-connect': exports1['6'],
+      '[method]tcp-socket.subscribe': trampoline11,
+      '[resource-drop]tcp-socket': trampoline3,
+    },
+    'wasi:sockets/udp-create-socket@0.2.0': {
+      'create-udp-socket': exports1['85'],
+    },
+    'wasi:sockets/udp@0.2.0': {
+      '[method]incoming-datagram-stream.receive': exports1['82'],
+      '[method]incoming-datagram-stream.subscribe': trampoline18,
+      '[method]outgoing-datagram-stream.check-send': exports1['83'],
+      '[method]outgoing-datagram-stream.send': exports1['84'],
+      '[method]outgoing-datagram-stream.subscribe': trampoline19,
+      '[method]udp-socket.address-family': trampoline16,
+      '[method]udp-socket.finish-bind': exports1['72'],
+      '[method]udp-socket.local-address': exports1['74'],
+      '[method]udp-socket.receive-buffer-size': exports1['78'],
+      '[method]udp-socket.remote-address': exports1['75'],
+      '[method]udp-socket.send-buffer-size': exports1['80'],
+      '[method]udp-socket.set-receive-buffer-size': exports1['79'],
+      '[method]udp-socket.set-send-buffer-size': exports1['81'],
+      '[method]udp-socket.set-unicast-hop-limit': exports1['77'],
+      '[method]udp-socket.start-bind': exports1['71'],
+      '[method]udp-socket.stream': exports1['73'],
+      '[method]udp-socket.subscribe': trampoline17,
+      '[method]udp-socket.unicast-hop-limit': exports1['76'],
+      '[resource-drop]incoming-datagram-stream': trampoline36,
+      '[resource-drop]outgoing-datagram-stream': trampoline37,
+      '[resource-drop]udp-socket': trampoline35,
+    },
+    wasi_snapshot_preview1: {
+      args_get: exports1['12'],
+      args_sizes_get: exports1['13'],
+      environ_get: exports1['14'],
+      environ_sizes_get: exports1['15'],
+      fd_close: exports1['16'],
+      fd_fdstat_set_flags: exports1['17'],
+      fd_prestat_dir_name: exports1['19'],
+      fd_prestat_get: exports1['18'],
+      fd_read: exports1['20'],
+      fd_readdir: exports1['21'],
+      fd_seek: exports1['22'],
+      path_filestat_get: exports1['23'],
+      path_open: exports1['24'],
+      path_remove_directory: exports1['25'],
+      path_unlink_file: exports1['26'],
+      proc_exit: exports1['27'],
     },
   }));
-  postReturn0 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[constructor]calc-session'];
-  postReturn1 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.push-op'];
-  postReturn2 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.get-current'];
-  memory0 = exports2.memory;
-  GlobalComponentMemories.save({ idx: 0, componentIdx: 2, memory: memory0 });
-  postReturn3 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.get-history'];
-  postReturn4 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.reset'];
-  postReturn5 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[constructor]number-stream'];
-  postReturn6 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci'];
-  postReturn7 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-squares'];
-  postReturn8 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-primes'];
-  postReturn9 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.read'];
-  postReturn10 = exports2['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.stop'];
-  postReturn11 = exports2['cabi_post_docs:calculator/calculate@0.1.0#eval-expression'];
-  postReturn12 = exports2['cabi_post_docs:calculator/calculate@0.1.0#eval-expression-detailed'];
-  postReturn13 = exports2['cabi_post_docs:calculator/calculate@0.1.0#generate-fibonacci'];
-  postReturn14 = exports2['cabi_post_docs:calculator/calculate@0.1.0#generate-squares'];
-  postReturn15 = exports2['cabi_post_docs:calculator/calculate@0.1.0#generate-primes'];
+  ({ exports: exports4 } = instantiateCore(module2, {
+    __main_module__: {
+      cabi_realloc_adapter: exports3.cabi_realloc_adapter,
+    },
+    env: {
+      memory: exports3.memory,
+    },
+    'wasi:cli/environment@0.2.3': {
+      'get-arguments': exports1['110'],
+      'get-environment': exports1['111'],
+    },
+    'wasi:cli/exit@0.2.3': {
+      exit: trampoline13,
+    },
+    'wasi:cli/stderr@0.2.3': {
+      'get-stderr': trampoline41,
+    },
+    'wasi:cli/stdin@0.2.3': {
+      'get-stdin': trampoline42,
+    },
+    'wasi:cli/stdout@0.2.3': {
+      'get-stdout': trampoline43,
+    },
+    'wasi:filesystem/preopens@0.2.3': {
+      'get-directories': exports1['127'],
+    },
+    'wasi:filesystem/types@0.2.3': {
+      '[method]descriptor.get-type': exports1['112'],
+      '[method]descriptor.metadata-hash': exports1['113'],
+      '[method]descriptor.metadata-hash-at': exports1['115'],
+      '[method]descriptor.open-at': exports1['122'],
+      '[method]descriptor.read-directory': exports1['119'],
+      '[method]descriptor.read-via-stream': exports1['118'],
+      '[method]descriptor.remove-directory-at': exports1['116'],
+      '[method]descriptor.stat': exports1['120'],
+      '[method]descriptor.stat-at': exports1['121'],
+      '[method]descriptor.unlink-file-at': exports1['117'],
+      '[method]directory-entry-stream.read-directory-entry': exports1['123'],
+      '[resource-drop]descriptor': trampoline32,
+      '[resource-drop]directory-entry-stream': trampoline33,
+      'filesystem-error-code': exports1['114'],
+    },
+    'wasi:io/error@0.2.3': {
+      '[resource-drop]error': trampoline31,
+    },
+    'wasi:io/streams@0.2.3': {
+      '[method]input-stream.blocking-read': exports1['125'],
+      '[method]input-stream.read': exports1['124'],
+      '[method]output-stream.blocking-write-and-flush': exports1['126'],
+      '[resource-drop]input-stream': trampoline1,
+      '[resource-drop]output-stream': trampoline2,
+    },
+  }));
+  memory0 = exports3.memory;
+  GlobalComponentMemories.save({ idx: 0, componentIdx: 3, memory: memory0 });
+  realloc0 = exports3.cabi_realloc;
+  realloc1 = exports4.cabi_import_realloc;
+  ({ exports: exports5 } = instantiateCore(module4, {
+    '': {
+      $imports: exports1.$imports,
+      '0': trampoline44,
+      '1': trampoline45,
+      '10': trampoline54,
+      '100': trampoline128,
+      '101': trampoline129,
+      '102': trampoline130,
+      '103': trampoline131,
+      '104': trampoline132,
+      '105': trampoline133,
+      '106': trampoline134,
+      '107': trampoline135,
+      '108': trampoline136,
+      '109': trampoline137,
+      '11': trampoline55,
+      '110': trampoline138,
+      '111': trampoline139,
+      '112': trampoline77,
+      '113': trampoline95,
+      '114': trampoline70,
+      '115': trampoline96,
+      '116': trampoline91,
+      '117': trampoline94,
+      '118': trampoline71,
+      '119': trampoline82,
+      '12': exports4.args_get,
+      '120': trampoline85,
+      '121': trampoline86,
+      '122': trampoline89,
+      '123': trampoline140,
+      '124': trampoline141,
+      '125': trampoline142,
+      '126': trampoline61,
+      '127': trampoline143,
+      '13': exports4.args_sizes_get,
+      '14': exports4.environ_get,
+      '15': exports4.environ_sizes_get,
+      '16': exports4.fd_close,
+      '17': exports4.fd_fdstat_set_flags,
+      '18': exports4.fd_prestat_get,
+      '19': exports4.fd_prestat_dir_name,
+      '2': trampoline46,
+      '20': exports4.fd_read,
+      '21': exports4.fd_readdir,
+      '22': exports4.fd_seek,
+      '23': exports4.path_filestat_get,
+      '24': exports4.path_open,
+      '25': exports4.path_remove_directory,
+      '26': exports4.path_unlink_file,
+      '27': exports4.proc_exit,
+      '28': trampoline56,
+      '29': trampoline57,
+      '3': trampoline47,
+      '30': trampoline58,
+      '31': trampoline59,
+      '32': trampoline60,
+      '33': trampoline61,
+      '34': trampoline62,
+      '35': trampoline63,
+      '36': trampoline64,
+      '37': trampoline65,
+      '38': trampoline66,
+      '39': trampoline67,
+      '4': trampoline48,
+      '40': trampoline68,
+      '41': trampoline69,
+      '42': trampoline70,
+      '43': trampoline71,
+      '44': trampoline72,
+      '45': trampoline73,
+      '46': trampoline74,
+      '47': trampoline75,
+      '48': trampoline76,
+      '49': trampoline77,
+      '5': trampoline49,
+      '50': trampoline78,
+      '51': trampoline79,
+      '52': trampoline80,
+      '53': trampoline81,
+      '54': trampoline82,
+      '55': trampoline83,
+      '56': trampoline84,
+      '57': trampoline85,
+      '58': trampoline86,
+      '59': trampoline87,
+      '6': trampoline50,
+      '60': trampoline88,
+      '61': trampoline89,
+      '62': trampoline90,
+      '63': trampoline91,
+      '64': trampoline92,
+      '65': trampoline93,
+      '66': trampoline94,
+      '67': trampoline95,
+      '68': trampoline96,
+      '69': trampoline97,
+      '7': trampoline51,
+      '70': trampoline98,
+      '71': trampoline99,
+      '72': trampoline100,
+      '73': trampoline101,
+      '74': trampoline102,
+      '75': trampoline103,
+      '76': trampoline104,
+      '77': trampoline105,
+      '78': trampoline106,
+      '79': trampoline107,
+      '8': trampoline52,
+      '80': trampoline108,
+      '81': trampoline109,
+      '82': trampoline110,
+      '83': trampoline111,
+      '84': trampoline112,
+      '85': trampoline113,
+      '86': trampoline114,
+      '87': trampoline115,
+      '88': trampoline116,
+      '89': trampoline117,
+      '9': trampoline53,
+      '90': trampoline118,
+      '91': trampoline119,
+      '92': trampoline120,
+      '93': trampoline121,
+      '94': trampoline122,
+      '95': trampoline123,
+      '96': trampoline124,
+      '97': trampoline125,
+      '98': trampoline126,
+      '99': trampoline127,
+    },
+  }));
+  postReturn0 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[constructor]calc-session'];
+  postReturn1 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.push-op'];
+  postReturn2 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.get-current'];
+  postReturn3 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.get-history'];
+  postReturn4 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]calc-session.reset'];
+  postReturn5 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[constructor]number-stream'];
+  postReturn6 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci'];
+  postReturn7 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-squares'];
+  postReturn8 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.start-primes'];
+  postReturn9 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.read'];
+  postReturn10 = exports3['cabi_post_docs:calculator/calculate@0.1.0#[method]number-stream.stop'];
+  postReturn11 = exports3['cabi_post_docs:calculator/calculate@0.1.0#eval-expression'];
+  postReturn12 = exports3['cabi_post_docs:calculator/calculate@0.1.0#eval-expression-detailed'];
+  postReturn13 = exports3['cabi_post_docs:calculator/calculate@0.1.0#generate-fibonacci'];
+  postReturn14 = exports3['cabi_post_docs:calculator/calculate@0.1.0#generate-squares'];
+  postReturn15 = exports3['cabi_post_docs:calculator/calculate@0.1.0#generate-primes'];
   let calculate010ConstructorCalcSession;
   
   class CalcSession{
@@ -2026,7 +27834,7 @@ let gen = (function* _initGenerator () {
       var handle1 = ret;
       var rsc0 = new.target === CalcSession ? this : Object.create(CalcSession.prototype);
       Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
-      finalizationRegistry0.register(rsc0, handle1, rsc0);
+      finalizationRegistry26.register(rsc0, handle1, rsc0);
       Object.defineProperty(rsc0, symbolDispose, { writable: true, value: emptyFunc });
       _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[constructor]calc-session"][Instruction::Return]', {
         funcName: '[constructor]calc-session',
@@ -2048,10 +27856,10 @@ let gen = (function* _initGenerator () {
   
   CalcSession.prototype.pushOp = function pushOp(arg1, arg2) {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable26[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
     }
-    var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable26[(handle1 << 1) + 1] & ~T_FLAG;
     var val2 = arg1;
     let enum2;
     switch (val2) {
@@ -2113,10 +27921,10 @@ let gen = (function* _initGenerator () {
   
   CalcSession.prototype.getCurrent = function getCurrent() {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable26[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
     }
-    var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable26[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.get-current"][Instruction::CallWasm] enter', {
       funcName: '[method]calc-session.get-current',
       paramCount: 1,
@@ -2156,10 +27964,10 @@ let gen = (function* _initGenerator () {
   
   CalcSession.prototype.getHistory = function getHistory() {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable26[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
     }
-    var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable26[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.get-history"][Instruction::CallWasm] enter', {
       funcName: '[method]calc-session.get-history',
       paramCount: 1,
@@ -2214,10 +28022,10 @@ let gen = (function* _initGenerator () {
   
   CalcSession.prototype.reset = function reset() {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable0[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable26[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "CalcSession" resource.');
     }
-    var handle0 = handleTable0[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable26[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]calc-session.reset"][Instruction::CallWasm] enter', {
       funcName: '[method]calc-session.reset',
       paramCount: 1,
@@ -2279,7 +28087,7 @@ let gen = (function* _initGenerator () {
       var handle1 = ret;
       var rsc0 = new.target === NumberStream ? this : Object.create(NumberStream.prototype);
       Object.defineProperty(rsc0, symbolRscHandle, { writable: true, value: handle1});
-      finalizationRegistry1.register(rsc0, handle1, rsc0);
+      finalizationRegistry27.register(rsc0, handle1, rsc0);
       Object.defineProperty(rsc0, symbolDispose, { writable: true, value: emptyFunc });
       _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[constructor]number-stream"][Instruction::Return]', {
         funcName: '[constructor]number-stream',
@@ -2301,10 +28109,10 @@ let gen = (function* _initGenerator () {
   
   NumberStream.prototype.startFibonacci = function startFibonacci() {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable27[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
     }
-    var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable27[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-fibonacci"][Instruction::CallWasm] enter', {
       funcName: '[method]number-stream.start-fibonacci',
       paramCount: 1,
@@ -2343,10 +28151,10 @@ let gen = (function* _initGenerator () {
   
   NumberStream.prototype.startSquares = function startSquares() {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable27[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
     }
-    var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable27[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-squares"][Instruction::CallWasm] enter', {
       funcName: '[method]number-stream.start-squares',
       paramCount: 1,
@@ -2385,10 +28193,10 @@ let gen = (function* _initGenerator () {
   
   NumberStream.prototype.startPrimes = function startPrimes() {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable27[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
     }
-    var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable27[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.start-primes"][Instruction::CallWasm] enter', {
       funcName: '[method]number-stream.start-primes',
       paramCount: 1,
@@ -2427,10 +28235,10 @@ let gen = (function* _initGenerator () {
   
   NumberStream.prototype.read = function read(arg1) {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable27[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
     }
-    var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable27[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.read"][Instruction::CallWasm] enter', {
       funcName: '[method]number-stream.read',
       paramCount: 2,
@@ -2473,10 +28281,10 @@ let gen = (function* _initGenerator () {
   
   NumberStream.prototype.stop = function stop() {
     var handle1 = this[symbolRscHandle];
-    if (!handle1 || (handleTable1[(handle1 << 1) + 1] & T_FLAG) === 0) {
+    if (!handle1 || (handleTable27[(handle1 << 1) + 1] & T_FLAG) === 0) {
       throw new TypeError('Resource error: Not a valid "NumberStream" resource.');
     }
-    var handle0 = handleTable1[(handle1 << 1) + 1] & ~T_FLAG;
+    var handle0 = handleTable27[(handle1 << 1) + 1] & ~T_FLAG;
     _debugLog('[iface="docs:calculator/calculate@0.1.0", function="[method]number-stream.stop"][Instruction::CallWasm] enter', {
       funcName: '[method]number-stream.stop',
       paramCount: 1,
@@ -2755,22 +28563,22 @@ let gen = (function* _initGenerator () {
     
     
   }
-  calculate010ConstructorCalcSession = exports2['docs:calculator/calculate@0.1.0#[constructor]calc-session'];
-  calculate010MethodCalcSessionPushOp = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.push-op'];
-  calculate010MethodCalcSessionGetCurrent = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.get-current'];
-  calculate010MethodCalcSessionGetHistory = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.get-history'];
-  calculate010MethodCalcSessionReset = exports2['docs:calculator/calculate@0.1.0#[method]calc-session.reset'];
-  calculate010ConstructorNumberStream = exports2['docs:calculator/calculate@0.1.0#[constructor]number-stream'];
-  calculate010MethodNumberStreamStartFibonacci = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci'];
-  calculate010MethodNumberStreamStartSquares = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.start-squares'];
-  calculate010MethodNumberStreamStartPrimes = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.start-primes'];
-  calculate010MethodNumberStreamRead = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.read'];
-  calculate010MethodNumberStreamStop = exports2['docs:calculator/calculate@0.1.0#[method]number-stream.stop'];
-  calculate010EvalExpression = exports2['docs:calculator/calculate@0.1.0#eval-expression'];
-  calculate010EvalExpressionDetailed = exports2['docs:calculator/calculate@0.1.0#eval-expression-detailed'];
-  calculate010GenerateFibonacci = exports2['docs:calculator/calculate@0.1.0#generate-fibonacci'];
-  calculate010GenerateSquares = exports2['docs:calculator/calculate@0.1.0#generate-squares'];
-  calculate010GeneratePrimes = exports2['docs:calculator/calculate@0.1.0#generate-primes'];
+  calculate010ConstructorCalcSession = exports3['docs:calculator/calculate@0.1.0#[constructor]calc-session'];
+  calculate010MethodCalcSessionPushOp = exports3['docs:calculator/calculate@0.1.0#[method]calc-session.push-op'];
+  calculate010MethodCalcSessionGetCurrent = exports3['docs:calculator/calculate@0.1.0#[method]calc-session.get-current'];
+  calculate010MethodCalcSessionGetHistory = exports3['docs:calculator/calculate@0.1.0#[method]calc-session.get-history'];
+  calculate010MethodCalcSessionReset = exports3['docs:calculator/calculate@0.1.0#[method]calc-session.reset'];
+  calculate010ConstructorNumberStream = exports3['docs:calculator/calculate@0.1.0#[constructor]number-stream'];
+  calculate010MethodNumberStreamStartFibonacci = exports3['docs:calculator/calculate@0.1.0#[method]number-stream.start-fibonacci'];
+  calculate010MethodNumberStreamStartSquares = exports3['docs:calculator/calculate@0.1.0#[method]number-stream.start-squares'];
+  calculate010MethodNumberStreamStartPrimes = exports3['docs:calculator/calculate@0.1.0#[method]number-stream.start-primes'];
+  calculate010MethodNumberStreamRead = exports3['docs:calculator/calculate@0.1.0#[method]number-stream.read'];
+  calculate010MethodNumberStreamStop = exports3['docs:calculator/calculate@0.1.0#[method]number-stream.stop'];
+  calculate010EvalExpression = exports3['docs:calculator/calculate@0.1.0#eval-expression'];
+  calculate010EvalExpressionDetailed = exports3['docs:calculator/calculate@0.1.0#eval-expression-detailed'];
+  calculate010GenerateFibonacci = exports3['docs:calculator/calculate@0.1.0#generate-fibonacci'];
+  calculate010GenerateSquares = exports3['docs:calculator/calculate@0.1.0#generate-squares'];
+  calculate010GeneratePrimes = exports3['docs:calculator/calculate@0.1.0#generate-primes'];
   const calculate010 = {
     CalcSession: CalcSession,
     NumberStream: NumberStream,

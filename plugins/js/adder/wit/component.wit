@@ -1,0 +1,7 @@
+package js-pl:test@1.0.0;
+
+
+world adder {
+    include wasi:cli/imports@0.2.0;
+    include docs:adder/adder@0.1.0;
+}

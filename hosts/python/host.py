@@ -11,19 +11,21 @@ Example:
 
 import sys
 import os
-from wasmtime import Engine, Store
+from wasmtime import Engine, Store, WasiConfig
 from wasmtime.component import Component, Linker
 
 
 def run(wasm_path: str):
     engine = Engine()
     store = Store(engine)
+    store.set_wasi(WasiConfig())
 
     # Load the composed component
     component = Component.from_file(engine, wasm_path)
 
     # Set up linker with stream-sink imports
     linker = Linker(engine)
+    linker.add_wasip2()
 
     # Stream-sink callback state
     collected_numbers = []

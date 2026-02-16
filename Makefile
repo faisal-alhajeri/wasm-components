@@ -20,18 +20,22 @@ GO_ADDER_DIR     := plugins/go/adder
 GO_CALC_DIR      := plugins/go/calculator
 
 # Go adder: wasm-unknown target (no WASI imports needed)
-$(BUILD_DIR)/go-adder.wasm: $(GO_ADDER_DIR)/main.go wit/adder/world.wit
+$(BUILD_DIR)/go-adder.wasm: $(GO_ADDER_DIR)/main.go $(GO_ADDER_DIR)/wit/component.wit wit/adder/world.wit
 	@echo "==> Building Go adder plugin"
-	cd $(GO_ADDER_DIR) && tinygo build -target=wasm-unknown -o adder-core.wasm .
+	cd $(GO_ADDER_DIR) && wkg wit build 
+	cd $(GO_ADDER_DIR) && go tool wit-bindgen-go generate --world adder --out gen  go-pl:test@1.0.0.wasm
+	cd $(GO_ADDER_DIR) && tinygo build -target=wasip2 -o adder-core.wasm .
 	cd $(GO_ADDER_DIR) && wasm-tools component embed --world adder ../../../wit/adder adder-core.wasm -o adder-embedded.wasm
 	cd $(GO_ADDER_DIR) && wasm-tools component new adder-embedded.wasm -o adder.wasm
 	cp $(GO_ADDER_DIR)/adder.wasm $@
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
 
 # Go calculator: wasm-unknown target
-$(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go wit/calculator/world.wit
+$(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go $(GO_CALC_DIR)/wit/component.wit wit/calculator/world.wit
 	@echo "==> Building Go calculator plugin"
-	cd $(GO_CALC_DIR) && tinygo build -target=wasm-unknown -o calculator-core.wasm .
+	cd $(GO_ADDER_DIR) && wkg wit build 
+	cd $(GO_ADDER_DIR) && go tool wit-bindgen-go generate --world calculator --out gen  go-pl:test@1.0.0.wasm
+	cd $(GO_CALC_DIR) && tinygo build -target=wasip2 -o calculator-core.wasm .
 	cd $(GO_CALC_DIR) && wasm-tools component embed --world calculator ../../../wit/calculator calculator-core.wasm -o calculator-embedded.wasm
 	cd $(GO_CALC_DIR) && wasm-tools component new calculator-embedded.wasm -o calculator.wasm
 	cp $(GO_CALC_DIR)/calculator.wasm $@
@@ -44,18 +48,18 @@ JS_CALC_DIR      := plugins/js/calculator
 
 $(BUILD_DIR)/js-adder.wasm: $(JS_ADDER_DIR)/adder.js wit/adder/world.wit
 	@echo "==> Building JS adder plugin"
-	jco componentize $(JS_ADDER_DIR)/adder.js \
-		--wit wit/adder/world.wit \
+	cd $(JS_ADDER_DIR) && jco componentize adder.js \
+		--wit wit \
 		--world-name adder \
-		--out $@ \
+		--out ../../../$@ \
 		--disable all
 
 $(BUILD_DIR)/js-calculator.wasm: $(JS_CALC_DIR)/calculator.js wit/calculator/world.wit
 	@echo "==> Building JS calculator plugin"
-	jco componentize $(JS_CALC_DIR)/calculator.js \
-		--wit wit/calculator \
-		--world-name calculator \
-		--out $@ \
+	cd $(JS_CALC_DIR) && jco componentize calculator.js \
+		--wit wit \
+		--world-name calc \
+		--out ../../../$@ \
 		--disable all
 
 plugins-go: $(BUILD_DIR)/go-adder.wasm $(BUILD_DIR)/go-calculator.wasm
