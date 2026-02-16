@@ -1,9 +1,10 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert";
+import type { Root } from "./transpiled/go/composed-go.js";
 import { getCalculate } from "./setup.js";
 
 describe("calc-session (go)", () => {
-  let calculate: any;
+  let calculate: Root["calculate"];
   before(async () => {
     const { calculate: c } = await getCalculate("go");
     calculate = c;
@@ -47,7 +48,7 @@ describe("calc-session (go)", () => {
 });
 
 describe("calc-session (js)", () => {
-  let calculate: any;
+  let calculate: Root["calculate"];
   before(async () => {
     const { calculate: c } = await getCalculate("js");
     calculate = c;

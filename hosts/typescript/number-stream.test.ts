@@ -1,9 +1,10 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert";
+import type { Root } from "./transpiled/go/composed-go.js";
 import { getCalculate } from "./setup.js";
 
 describe("number-stream (go)", () => {
-  let calculate: any;
+  let calculate: Root["calculate"];
   before(async () => {
     const { calculate: c } = await getCalculate("go");
     calculate = c;
@@ -35,7 +36,7 @@ describe("number-stream (go)", () => {
 });
 
 describe("number-stream (js)", () => {
-  let calculate: any;
+  let calculate: Root["calculate"];
   before(async () => {
     const { calculate: c } = await getCalculate("js");
     calculate = c;

@@ -1,15 +1,16 @@
 import * as fs from "fs";
 import * as path from "path";
 import { WASIShim } from "@bytecodealliance/preview2-shim/instantiation";
+import type { Root } from "./transpiled/go/composed-go.js";
 
 const cache = new Map<
   string,
-  { calculate: any; collectedNumbers: number[] }
+  { calculate: Root["calculate"]; collectedNumbers: number[] }
 >();
 
 export async function getCalculate(
   variant: "go" | "js"
-): Promise<{ calculate: any; collectedNumbers: number[] }> {
+): Promise<{ calculate: Root["calculate"]; collectedNumbers: number[] }> {
   const cached = cache.get(variant);
   if (cached) return cached;
 
@@ -43,7 +44,7 @@ export async function getCalculate(
     "docs:calculator/stream-sink": streamSinkImpl,
   };
 
-  const root = instantiate(getCoreModule, imports);
+  const root = instantiate(getCoreModule, imports) as Root;
   if (!root.calculate) throw new Error("calculate exports not found");
 
   const result = { calculate: root.calculate, collectedNumbers };
