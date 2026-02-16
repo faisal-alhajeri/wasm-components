@@ -91,7 +91,7 @@ func init() {
 			current: 0,
 			history: nil,
 		}
-		return cm.Reinterpret[calculate.CalcSession](handle)
+		return calculate.CalcSessionResourceNew(cm.Reinterpret[cm.Rep](handle))
 	}
 
 	calculate.Exports.CalcSession.GetHistory = func(self cm.Rep) cm.List[calculate.CalcResult] {
@@ -147,7 +147,7 @@ func init() {
 		handle := streamCounter
 		streamCounter++
 		streams[handle] = &streamState{}
-		return cm.Reinterpret[calculate.NumberStream](handle)
+		return calculate.NumberStreamResourceNew(cm.Reinterpret[cm.Rep](handle))
 	}
 
 	calculate.Exports.NumberStream.StartFibonacci = func(self cm.Rep) {

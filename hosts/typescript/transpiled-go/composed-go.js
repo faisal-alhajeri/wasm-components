@@ -585,6 +585,19 @@ export function instantiate(getCoreModule, imports, instantiateCore = (module, i
   
   const T_FLAG = 1 << 30;
   
+  function rscTableCreateOwn(table, rep) {
+    const free = table[0] & ~T_FLAG;
+    if (free === 0) {
+      table.push(0);
+      table.push(rep | T_FLAG);
+      return (table.length >> 1) - 1;
+    }
+    table[0] = table[free << 1];
+    table[free << 1] = 0;
+    table[(free << 1) + 1] = rep | T_FLAG;
+    return free;
+  }
+  
   function rscTableRemove(table, handle) {
     const scope = table[handle << 1];
     const val = table[(handle << 1) + 1];
@@ -1730,7 +1743,7 @@ let gen = (function* _initGenerator () {
   };
   
   
-  function trampoline0(arg0) {
+  function trampoline2(arg0) {
     _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-number"] [Instruction::CallInterface] (sync, @ enter)');
     let hostProvided = false;
     hostProvided = onNumber?._isHostProvided;
@@ -1790,7 +1803,7 @@ let gen = (function* _initGenerator () {
   };
   
   
-  function trampoline1() {
+  function trampoline3() {
     _debugLog('[iface="docs:calculator/stream-sink@0.1.0", function="on-done"] [Instruction::CallInterface] (sync, @ enter)');
     let hostProvided = false;
     hostProvided = onDone?._isHostProvided;
@@ -1846,6 +1859,22 @@ let gen = (function* _initGenerator () {
   let exports5;
   let exports6;
   let memory0;
+  const handleTable0 = [T_FLAG, 0];
+  const finalizationRegistry0 = finalizationRegistryCreate((handle) => {
+    const { rep } = rscTableRemove(handleTable0, handle);
+    exports2['0'](rep);
+  });
+  
+  handleTables[0] = handleTable0;
+  const trampoline0 = rscTableCreateOwn.bind(null, handleTable0);
+  const handleTable1 = [T_FLAG, 0];
+  const finalizationRegistry1 = finalizationRegistryCreate((handle) => {
+    const { rep } = rscTableRemove(handleTable1, handle);
+    exports2['1'](rep);
+  });
+  
+  handleTables[1] = handleTable1;
+  const trampoline1 = rscTableCreateOwn.bind(null, handleTable1);
   
   GlobalComponentAsyncLowers.define({
     componentIdx: lowered_import_0_metadata.moduleIdx,
@@ -1853,7 +1882,7 @@ let gen = (function* _initGenerator () {
     fn: _lowerImport.bind(
     null,
     {
-      trampolineIdx: 0,
+      trampolineIdx: 2,
       componentIdx: 3,
       isAsync: false,
       paramLiftFns: [_liftFlatU32],
@@ -1876,7 +1905,7 @@ let gen = (function* _initGenerator () {
     fn: _lowerImport.bind(
     null,
     {
-      trampolineIdx: 1,
+      trampolineIdx: 3,
       componentIdx: 3,
       isAsync: false,
       paramLiftFns: [],
@@ -1911,14 +1940,18 @@ let gen = (function* _initGenerator () {
     },
   }));
   ({ exports: exports4 } = instantiateCore(module2, {
+    '[export]docs:calculator/calculate@0.1.0': {
+      '[resource-new]calc-session': trampoline0,
+      '[resource-new]number-stream': trampoline1,
+    },
     'docs:adder/add@0.1.0': {
       add: exports3.adapter0,
       mul: exports3.adapter2,
       sub: exports3.adapter1,
     },
     'docs:calculator/stream-sink@0.1.0': {
-      'on-done': trampoline1,
-      'on-number': trampoline0,
+      'on-done': trampoline3,
+      'on-number': trampoline2,
     },
   }));
   ({ exports: exports5 } = instantiateCore(module4, {
@@ -1935,13 +1968,6 @@ let gen = (function* _initGenerator () {
   }));
   memory0 = exports4.memory;
   GlobalComponentMemories.save({ idx: 0, componentIdx: 4, memory: memory0 });
-  const handleTable0 = [T_FLAG, 0];
-  const finalizationRegistry0 = finalizationRegistryCreate((handle) => {
-    const { rep } = rscTableRemove(handleTable0, handle);
-    exports2['0'](rep);
-  });
-  
-  handleTables[0] = handleTable0;
   let calculate010ConstructorCalcSession;
   
   class CalcSession{
@@ -2166,13 +2192,6 @@ let gen = (function* _initGenerator () {
       postReturn: false
     });
   };
-  const handleTable1 = [T_FLAG, 0];
-  const finalizationRegistry1 = finalizationRegistryCreate((handle) => {
-    const { rep } = rscTableRemove(handleTable1, handle);
-    exports2['1'](rep);
-  });
-  
-  handleTables[1] = handleTable1;
   let calculate010ConstructorNumberStream;
   
   class NumberStream{
