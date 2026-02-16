@@ -83,29 +83,29 @@ export const calculate = {
     }
 
     read(count) {
-      const results = [];
+      const results = new Uint32Array(count);
       for (let i = 0; i < count; i++) {
         switch (this.kind) {
           case "fibonacci": {
-            results.push(this.state.curr);
+            results[i] = this.state.curr;
             const next = this.state.prev + this.state.curr;
             this.state.prev = this.state.curr;
             this.state.curr = next;
             break;
           }
           case "squares": {
-            results.push(this.state.index * this.state.index);
+            results[i] = this.state.index * this.state.index;
             this.state.index++;
             break;
           }
           case "primes": {
             const p = nextPrime(this.state.next);
-            results.push(p);
+            results[i] = p;
             this.state.next = p + 1;
             break;
           }
           default:
-            return results;
+            return new Uint32Array(0);
         }
       }
       return results;
