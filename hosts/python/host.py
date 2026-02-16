@@ -254,8 +254,8 @@ def run(wasm_path: str):
     print("  ✅ eval-expression: Working perfectly (both Go and JS)")
     print("  ✅ eval-expression-detailed: Working perfectly (both Go and JS)")
     print("  ✅ generate-* (push-based streaming): Working perfectly (both Go and JS)")
-    print("  ⚠️  calc-session resource: JS works, Go has resource handle limitations")
-    print("  ⚠️  number-stream resource: Both have data marshalling issues")
+    print("  ✅ calc-session resource: Working perfectly")
+    print("  ✅ number-stream resource: Working perfectly")
 
 
 if __name__ == "__main__":

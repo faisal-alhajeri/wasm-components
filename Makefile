@@ -124,7 +124,7 @@ all: plugins-go plugins-js compose hosts-transpile
 clean:
 	rm -rf $(BUILD_DIR)/*.wasm
 	rm -rf $(TS_HOST_DIR)/transpiled/go $(TS_HOST_DIR)/transpiled/js
-	rm -rf $(JS_ADDER_DIR)/dist $(JS_CALC_DIR)/dist $(JS_CALC_DIR)/types
+	rm -rf $(JS_ADDER_DIR)/dist $(JS_CALC_DIR)/dist $(JS_CALC_DIR)/types $(JS_ADDER_DIR)/wit.d.ts 
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
 	rm -f $(GO_CALC_DIR)/calculator.wasm
 	@echo "==> Cleaned build artifacts"

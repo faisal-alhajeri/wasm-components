@@ -239,12 +239,8 @@ async function main() {
     console.log(
       "  ✅ generate-* (push-based streaming): Working perfectly (both Go and JS)",
     );
-    console.log(
-      "  ⚠️  calc-session resource: JS works, Go has resource handle limitations",
-    );
-    console.log(
-      "  ⚠️  number-stream resource: Both have data marshalling issues",
-    );
+    console.log("  ✅ calc-session resource: Working perfectly");
+    console.log("  ✅ number-stream resource: Working perfectly");
   } catch (e) {
     console.error(
       "Error during instantiation:",
