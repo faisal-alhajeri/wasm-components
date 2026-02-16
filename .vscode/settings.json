@@ -1,4 +1,4 @@
 {
-    "python.languageServer": "Pylance",
+    "python.languageServer": "None",
     "python-envs.pythonProjects": []
 }
