@@ -23,7 +23,7 @@ import { WASIShim } from "@bytecodealliance/preview2-shim/instantiation";
 async function main() {
   const variant = process.argv[2] || "go";
   const transpiledDir =
-    variant === "go" ? "./transpiled-go" : "./transpiled-js";
+    variant === "go" ? "./transpiled/go" : "./transpiled/js";
   const modPath = `${transpiledDir}/composed-${variant}.js`;
 
   console.time("import");
