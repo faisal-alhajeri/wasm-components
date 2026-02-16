@@ -10,7 +10,7 @@
 #   - wkg (wasm package tool)
 
 .PHONY: all clean plugins-go plugins-js compose hosts-transpile \
-        run-python-go run-python-js run-ts-go run-ts-js run-all
+        run-python run-ts run-all
 
 BUILD_DIR := build
 
@@ -98,23 +98,15 @@ hosts-transpile: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm
 
 # ─── Run targets ──────────────────────────────────────────────────────────────
 
-run-python-go: $(BUILD_DIR)/composed-go.wasm
-	@echo "==> Running Python host with Go component"
-	cd hosts/python && uv run python3 host.py ../../$(BUILD_DIR)/composed-go.wasm
+run-python: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm
+	@echo "==> Running Python tests"
+	cd hosts/python && uv run pytest -v
 
-run-python-js: $(BUILD_DIR)/composed-js.wasm
-	@echo "==> Running Python host with JS component"
-	cd hosts/python && uv run python3 host.py ../../$(BUILD_DIR)/composed-js.wasm
+run-ts: hosts-transpile
+	@echo "==> Running TypeScript tests"
+	cd $(TS_HOST_DIR) && node --experimental-wasm-type-reflection --import tsx --test '*.test.ts'
 
-run-ts-go: hosts-transpile
-	@echo "==> Running TypeScript host with Go component"
-	cd $(TS_HOST_DIR) && node --experimental-wasm-type-reflection host.ts go
-
-run-ts-js: hosts-transpile
-	@echo "==> Running TypeScript host with JS component"
-	cd $(TS_HOST_DIR) && node --experimental-wasm-type-reflection host.ts js
-
-run-all: run-python-go run-python-js run-ts-go run-ts-js
+run-all: run-python run-ts
 
 # ─── Top-level targets ────────────────────────────────────────────────────────
 

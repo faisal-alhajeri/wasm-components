@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start:go": "node --experimental-wasm-type-reflection host.ts go",
-    "start:js": "node --experimental-wasm-type-reflection host.ts js"
+    "test": "node --experimental-wasm-type-reflection --import tsx --test '*.test.ts'"
   },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0"
   },
   "dependencies": {
     "@bytecodealliance/preview2-shim": "^0.17.0"

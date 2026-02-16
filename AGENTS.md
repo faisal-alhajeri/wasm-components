@@ -46,25 +46,17 @@ Run these from `tests/components/`:
 
 Each host can run against the composed components (Go or JS variants).
 
-- **Run All Hosts:**
+- **Run All Tests:**
   ```bash
   make run-all
   ```
-- **Run Python Host (Go Component):**
+- **Run Python Tests (pytest, both Go/JS variants):**
   ```bash
-  make run-python-go
+  make run-python
   ```
-- **Run Python Host (JS Component):**
+- **Run TypeScript Tests (node:test, both Go/JS variants):**
   ```bash
-  make run-python-js
-  ```
-- **Run TypeScript Host (Go Component):**
-  ```bash
-  make run-ts-go
-  ```
-- **Run TypeScript Host (JS Component):**
-  ```bash
-  make run-ts-js
+  make run-ts
   ```
 - **Clean Artifacts:**
   ```bash
