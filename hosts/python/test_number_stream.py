@@ -1,4 +1,7 @@
-def test_number_stream(wasm_component):
+from conftest import WasmCtx
+
+
+def test_number_stream(wasm_component: WasmCtx) -> None:
     ctx = wasm_component
     ctor = ctx.get_func("[constructor]number-stream")
     assert ctor is not None
@@ -7,7 +10,11 @@ def test_number_stream(wasm_component):
     start_primes = ctx.get_func("[method]number-stream.start-primes")
     read = ctx.get_func("[method]number-stream.read")
     stop = ctx.get_func("[method]number-stream.stop")
-    assert all((start_fib, start_squares, start_primes, read, stop))
+    assert start_fib is not None
+    assert start_squares is not None
+    assert start_primes is not None
+    assert read is not None
+    assert stop is not None
 
     stream = ctor(ctx.store)
     ctor.post_return(ctx.store)

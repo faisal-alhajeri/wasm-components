@@ -10,7 +10,7 @@
 #   - wkg (wasm package tool)
 
 .PHONY: all clean plugins-go plugins-js compose hosts-transpile \
-        run-python run-ts run-all
+        run-python run-ts run-all check-types
 
 BUILD_DIR := build
 
@@ -107,6 +107,9 @@ run-ts: hosts-transpile
 	cd $(TS_HOST_DIR) && node --experimental-wasm-type-reflection --import tsx --test '*.test.ts'
 
 run-all: run-python run-ts
+
+check-types:
+	cd hosts/python && uv run pyright
 
 # ─── Top-level targets ────────────────────────────────────────────────────────
 

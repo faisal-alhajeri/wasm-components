@@ -1,4 +1,7 @@
-def test_generate_fibonacci(wasm_component):
+from conftest import WasmCtx
+
+
+def test_generate_fibonacci(wasm_component: WasmCtx) -> None:
     ctx = wasm_component
     f = ctx.get_func("generate-fibonacci")
     assert f is not None
@@ -8,7 +11,7 @@ def test_generate_fibonacci(wasm_component):
     assert ctx.collected_numbers == [1, 1, 2, 3, 5, 8, 13, 21, 34, 55]
 
 
-def test_generate_squares(wasm_component):
+def test_generate_squares(wasm_component: WasmCtx) -> None:
     ctx = wasm_component
     f = ctx.get_func("generate-squares")
     assert f is not None
@@ -18,7 +21,7 @@ def test_generate_squares(wasm_component):
     assert ctx.collected_numbers == [1, 4, 9, 16, 25]
 
 
-def test_generate_primes(wasm_component):
+def test_generate_primes(wasm_component: WasmCtx) -> None:
     ctx = wasm_component
     f = ctx.get_func("generate-primes")
     assert f is not None

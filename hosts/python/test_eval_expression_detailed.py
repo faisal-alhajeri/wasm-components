@@ -1,4 +1,7 @@
-def test_eval_expression_detailed_add(wasm_component):
+from conftest import WasmCtx
+
+
+def test_eval_expression_detailed_add(wasm_component: WasmCtx) -> None:
     ctx = wasm_component
     f = ctx.get_func("eval-expression-detailed")
     assert f is not None
@@ -10,7 +13,7 @@ def test_eval_expression_detailed_add(wasm_component):
     assert r.y == 7
 
 
-def test_eval_expression_detailed_mul(wasm_component):
+def test_eval_expression_detailed_mul(wasm_component: WasmCtx) -> None:
     ctx = wasm_component
     f = ctx.get_func("eval-expression-detailed")
     assert f is not None

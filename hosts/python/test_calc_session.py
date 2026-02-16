@@ -1,4 +1,7 @@
-def test_calc_session(wasm_component):
+from conftest import WasmCtx
+
+
+def test_calc_session(wasm_component: WasmCtx) -> None:
     ctx = wasm_component
     ctor = ctx.get_func("[constructor]calc-session")
     assert ctor is not None
@@ -6,7 +9,10 @@ def test_calc_session(wasm_component):
     get_current = ctx.get_func("[method]calc-session.get-current")
     get_history = ctx.get_func("[method]calc-session.get-history")
     reset = ctx.get_func("[method]calc-session.reset")
-    assert all((push_op, get_current, get_history, reset))
+    assert push_op is not None
+    assert get_current is not None
+    assert get_history is not None
+    assert reset is not None
 
     session = ctor(ctx.store)
     ctor.post_return(ctx.store)
