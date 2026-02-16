@@ -24,19 +24,19 @@ $(BUILD_DIR)/go-adder.wasm: $(GO_ADDER_DIR)/main.go $(GO_ADDER_DIR)/wit/componen
 	@echo "==> Building Go adder plugin"
 	cd $(GO_ADDER_DIR) && wkg wit build 
 	cd $(GO_ADDER_DIR) && go tool wit-bindgen-go generate --world adder --out gen  go-pl:test@1.0.0.wasm
-	cd $(GO_ADDER_DIR) && tinygo build -target=wasip2 -o adder-core.wasm .
-	cd $(GO_ADDER_DIR) && wasm-tools component embed --world adder ../../../wit/adder adder-core.wasm -o adder-embedded.wasm
+	cd $(GO_ADDER_DIR) && tinygo build -target=wasm-unknown -o adder-core.wasm .
+	cd $(GO_ADDER_DIR) && wasm-tools component embed  wit --world adder adder-core.wasm -o adder-embedded.wasm
 	cd $(GO_ADDER_DIR) && wasm-tools component new adder-embedded.wasm -o adder.wasm
 	cp $(GO_ADDER_DIR)/adder.wasm $@
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
 
-# Go calculator: wasm-unknown target
+# Go calculator: imports custom interface, needs manual embed+new pipeline
 $(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go $(GO_CALC_DIR)/wit/component.wit wit/calculator/world.wit
 	@echo "==> Building Go calculator plugin"
-	cd $(GO_ADDER_DIR) && wkg wit build 
-	cd $(GO_ADDER_DIR) && go tool wit-bindgen-go generate --world calculator --out gen  go-pl:test@1.0.0.wasm
-	cd $(GO_CALC_DIR) && tinygo build -target=wasip2 -o calculator-core.wasm .
-	cd $(GO_CALC_DIR) && wasm-tools component embed --world calculator ../../../wit/calculator calculator-core.wasm -o calculator-embedded.wasm
+	cd $(GO_CALC_DIR) && wkg wit build 
+	cd $(GO_CALC_DIR) && go tool wit-bindgen-go generate --world calc --out gen  go-pl:test@1.0.0.wasm
+	cd $(GO_CALC_DIR) && tinygo build -target=wasm-unknown -o calculator-core.wasm .
+	cd $(GO_CALC_DIR) && wasm-tools component embed wit --world calc  calculator-core.wasm -o calculator-embedded.wasm
 	cd $(GO_CALC_DIR) && wasm-tools component new calculator-embedded.wasm -o calculator.wasm
 	cp $(GO_CALC_DIR)/calculator.wasm $@
 	rm -f $(GO_CALC_DIR)/calculator-core.wasm $(GO_CALC_DIR)/calculator-embedded.wasm $(GO_CALC_DIR)/calculator.wasm
