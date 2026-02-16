@@ -1,8 +1,8 @@
 import { add, sub, mul } from "docs:adder/add@0.1.0";
 import { onNumber, onDone } from "docs:calculator/stream-sink@0.1.0";
-import type { Op, CalcResult } from "./types/interfaces/docs-calculator-calculate.js";
+import * as Calc from "./types/interfaces/docs-calculator-calculate.js";
 
-function compute(op: Op, x: number, y: number): number {
+function compute(op: Calc.Op, x: number, y: number): number {
   switch (op) {
     case "add":
       return add(x, y);
@@ -35,22 +35,22 @@ type StreamConfig =
   | { kind: "primes"; next: number }
   | { kind: null };
 
-export const calculate = {
-  evalExpression(op: Op, x: number, y: number): string {
+export const calculate: typeof Calc = {
+  evalExpression(op: Calc.Op, x: number, y: number): string {
     const result = compute(op, x, y);
     return `the operation of ${x} ${op} ${y} = ${result}`;
   },
 
-  evalExpressionDetailed(op: Op, x: number, y: number): CalcResult {
+  evalExpressionDetailed(op: Calc.Op, x: number, y: number): Calc.CalcResult {
     const result = compute(op, x, y);
     return { value: result, op, x, y };
   },
 
   CalcSession: class CalcSession {
     current: number = 0;
-    history: CalcResult[] = [];
+    history: Calc.CalcResult[] = [];
 
-    pushOp(op: Op, value: number): void {
+    pushOp(op: Calc.Op, value: number): void {
       const result = compute(op, this.current, value);
       this.history.push({ value: result, op, x: this.current, y: value });
       this.current = result;
@@ -60,7 +60,7 @@ export const calculate = {
       return this.current;
     }
 
-    getHistory(): CalcResult[] {
+    getHistory(): Calc.CalcResult[] {
       return this.history;
     }
 
