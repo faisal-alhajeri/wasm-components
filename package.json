@@ -1,0 +1,7 @@
+{
+  "name": "wasm-components",
+  "private": true,
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

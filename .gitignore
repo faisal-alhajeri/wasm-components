@@ -4,3 +4,6 @@ node_modules/
 gen/
 deps/
 transpiled/
+plugins/js/*/dist/
+plugins/js/*/types/
+build/

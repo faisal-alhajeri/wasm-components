@@ -51,17 +51,17 @@ $(BUILD_DIR)/go-calculator.wasm: $(GO_CALC_DIR)/main.go $(GO_CALC_DIR)/wit/compo
 JS_ADDER_DIR     := plugins/js/adder
 JS_CALC_DIR      := plugins/js/calculator
 
-$(BUILD_DIR)/js-adder.wasm: $(JS_ADDER_DIR)/adder.js wit/adder/world.wit $(BUILD_DIR)
+$(BUILD_DIR)/js-adder.wasm: $(JS_ADDER_DIR)/adder.ts wit/adder/world.wit $(BUILD_DIR)
 	@echo "==> Building JS adder plugin"
-	cd $(JS_ADDER_DIR) && jco componentize adder.js \
+	cd $(JS_ADDER_DIR) && npx tsc && jco componentize dist/adder.js \
 		--wit wit \
 		--world-name adder \
 		--out ../../../$@ \
 		--disable all
 
-$(BUILD_DIR)/js-calculator.wasm: $(JS_CALC_DIR)/calculator.js wit/calculator/world.wit $(BUILD_DIR)
+$(BUILD_DIR)/js-calculator.wasm: $(JS_CALC_DIR)/calculator.ts wit/calculator/world.wit $(BUILD_DIR)
 	@echo "==> Building JS calculator plugin"
-	cd $(JS_CALC_DIR) && jco componentize calculator.js \
+	cd $(JS_CALC_DIR) && jco types wit --world-name calc -o types && npx tsc && jco componentize dist/calculator.js \
 		--wit wit \
 		--world-name calc \
 		--out ../../../$@ \
@@ -124,6 +124,7 @@ all: plugins-go plugins-js compose hosts-transpile
 clean:
 	rm -rf $(BUILD_DIR)/*.wasm
 	rm -rf $(TS_HOST_DIR)/transpiled/go $(TS_HOST_DIR)/transpiled/js
+	rm -rf $(JS_ADDER_DIR)/dist $(JS_CALC_DIR)/dist $(JS_CALC_DIR)/types
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
 	rm -f $(GO_CALC_DIR)/calculator.wasm
 	@echo "==> Cleaned build artifacts"

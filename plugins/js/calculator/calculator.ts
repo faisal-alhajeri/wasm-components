@@ -1,16 +1,21 @@
 import { add, sub, mul } from "docs:adder/add@0.1.0";
 import { onNumber, onDone } from "docs:calculator/stream-sink@0.1.0";
+import type { Op, CalcResult } from "./types/interfaces/docs-calculator-calculate.js";
 
-function compute(op, x, y) {
+function compute(op: Op, x: number, y: number): number {
   switch (op) {
-    case "add": return add(x, y);
-    case "sub": return sub(x, y);
-    case "mul": return mul(x, y);
-    default: return 0;
+    case "add":
+      return add(x, y);
+    case "sub":
+      return sub(x, y);
+    case "mul":
+      return mul(x, y);
+    default:
+      return 0;
   }
 }
 
-function isPrime(n) {
+function isPrime(n: number): boolean {
   if (n < 2) return false;
   for (let i = 2; i * i <= n; i++) {
     if (n % i === 0) return false;
@@ -18,90 +23,87 @@ function isPrime(n) {
   return true;
 }
 
-function nextPrime(start) {
+function nextPrime(start: number): number {
   let n = start;
   while (!isPrime(n)) n++;
   return n;
 }
 
+type StreamConfig =
+  | { kind: "fibonacci"; prev: number; curr: number }
+  | { kind: "squares"; index: number }
+  | { kind: "primes"; next: number }
+  | { kind: null };
+
 export const calculate = {
-  evalExpression(op, x, y) {
+  evalExpression(op: Op, x: number, y: number): string {
     const result = compute(op, x, y);
     return `the operation of ${x} ${op} ${y} = ${result}`;
   },
 
-  evalExpressionDetailed(op, x, y) {
+  evalExpressionDetailed(op: Op, x: number, y: number): CalcResult {
     const result = compute(op, x, y);
     return { value: result, op, x, y };
   },
 
   CalcSession: class CalcSession {
-    constructor() {
-      this.current = 0;
-      this.history = [];
-    }
+    current: number = 0;
+    history: CalcResult[] = [];
 
-    pushOp(op, value) {
+    pushOp(op: Op, value: number): void {
       const result = compute(op, this.current, value);
       this.history.push({ value: result, op, x: this.current, y: value });
       this.current = result;
     }
 
-    getCurrent() {
+    getCurrent(): number {
       return this.current;
     }
 
-    getHistory() {
+    getHistory(): CalcResult[] {
       return this.history;
     }
 
-    reset() {
+    reset(): void {
       this.current = 0;
       this.history = [];
     }
   },
 
   NumberStream: class NumberStream {
-    constructor() {
-      this.kind = null;
-      this.state = {};
+    config: StreamConfig = { kind: null };
+
+    startFibonacci(): void {
+      this.config = { kind: "fibonacci", prev: 0, curr: 1 };
     }
 
-    startFibonacci() {
-      this.kind = "fibonacci";
-      this.state = { prev: 0, curr: 1 };
+    startSquares(): void {
+      this.config = { kind: "squares", index: 1 };
     }
 
-    startSquares() {
-      this.kind = "squares";
-      this.state = { index: 1 };
+    startPrimes(): void {
+      this.config = { kind: "primes", next: 2 };
     }
 
-    startPrimes() {
-      this.kind = "primes";
-      this.state = { next: 2 };
-    }
-
-    read(count) {
+    read(count: number): Uint32Array {
       const results = new Uint32Array(count);
       for (let i = 0; i < count; i++) {
-        switch (this.kind) {
+        switch (this.config.kind) {
           case "fibonacci": {
-            results[i] = this.state.curr;
-            const next = this.state.prev + this.state.curr;
-            this.state.prev = this.state.curr;
-            this.state.curr = next;
+            results[i] = this.config.curr;
+            const next = this.config.prev + this.config.curr;
+            this.config = { kind: "fibonacci", prev: this.config.curr, curr: next };
             break;
           }
           case "squares": {
-            results[i] = this.state.index * this.state.index;
-            this.state.index++;
+            results[i] = this.config.index * this.config.index;
+            this.config = { kind: "squares", index: this.config.index + 1 };
             break;
           }
           case "primes": {
-            const p = nextPrime(this.state.next);
+            const p = nextPrime(this.config.next);
             results[i] = p;
-            this.state.next = p + 1;
+            this.config = { kind: "primes", next: p + 1 };
             break;
           }
           default:
@@ -111,14 +113,14 @@ export const calculate = {
       return results;
     }
 
-    stop() {
-      this.kind = null;
-      this.state = {};
+    stop(): void {
+      this.config = { kind: null };
     }
   },
 
-  generateFibonacci(maxCount) {
-    let prev = 0, curr = 1;
+  generateFibonacci(maxCount: number): void {
+    let prev = 0,
+      curr = 1;
     for (let i = 0; i < maxCount; i++) {
       const keepGoing = onNumber(curr);
       if (!keepGoing) break;
@@ -129,7 +131,7 @@ export const calculate = {
     onDone();
   },
 
-  generateSquares(maxCount) {
+  generateSquares(maxCount: number): void {
     for (let i = 1; i <= maxCount; i++) {
       const keepGoing = onNumber(i * i);
       if (!keepGoing) break;
@@ -137,7 +139,7 @@ export const calculate = {
     onDone();
   },
 
-  generatePrimes(maxCount) {
+  generatePrimes(maxCount: number): void {
     let n = 2;
     let count = 0;
     while (count < maxCount) {
