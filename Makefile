@@ -8,8 +8,9 @@
 #   - uv (Python package manager)
 #   - node (>= 22)
 #   - wkg (wasm package tool)
+#   - componentize-py (pip/uv)
 
-.PHONY: all clean plugins-go plugins-js compose hosts-transpile \
+.PHONY: all clean plugins-go plugins-js plugins-py compose hosts-transpile \
         run-python run-ts run-all check-types
 
 BUILD_DIR := build
@@ -71,6 +72,25 @@ plugins-go: $(BUILD_DIR)/go-adder.wasm $(BUILD_DIR)/go-calculator.wasm
 
 plugins-js: $(BUILD_DIR)/js-adder.wasm $(BUILD_DIR)/js-calculator.wasm 
 
+# ─── Python Plugins (componentize-py) ─────────────────────────────────────────
+
+PY_ADDER_DIR     := plugins/python/adder
+PY_CALC_DIR      := plugins/python/calculator
+HOSTS_PY         := hosts/python
+
+$(BUILD_DIR)/py-adder.wasm: $(PY_ADDER_DIR)/app.py $(PY_ADDER_DIR)/wit/component.wit wit/adder/world.wit $(BUILD_DIR)
+	@echo "==> Building Python adder plugin"
+	cd $(PY_ADDER_DIR) && wkg wit fetch 
+	cd $(HOSTS_PY) && uv run componentize-py -d ../../$(PY_ADDER_DIR)/wit -w adder componentize --stub-wasi -p ../../$(PY_ADDER_DIR) app -o ../../$@
+
+$(BUILD_DIR)/py-calculator.wasm: $(PY_CALC_DIR)/calculate.py $(PY_CALC_DIR)/wit/component.wit wit/calculator/world.wit $(BUILD_DIR)
+	@echo "==> Building Python calculator plugin"
+	cd $(PY_CALC_DIR) && wkg wit fetch 
+	cd $(PY_CALC_DIR) && uv run --project ../../$(HOSTS_PY) componentize-py -d wit -w calc --world-module wit_calc bindings . 2>/dev/null || true
+	cd $(HOSTS_PY) && uv run componentize-py -d ../../$(PY_CALC_DIR)/wit -w calc --world-module wit_calc componentize --stub-wasi -p ../../$(PY_CALC_DIR) calculate -o ../../$@
+
+plugins-py: $(BUILD_DIR)/py-adder.wasm $(BUILD_DIR)/py-calculator.wasm
+
 # ─── Compose (wac plug: calculator + adder → composed) ──────────────
 
 $(BUILD_DIR)/composed-go.wasm: $(BUILD_DIR)/go-calculator.wasm $(BUILD_DIR)/go-adder.wasm
@@ -85,20 +105,27 @@ $(BUILD_DIR)/composed-js.wasm: $(BUILD_DIR)/js-calculator.wasm $(BUILD_DIR)/js-a
 		--plug $(BUILD_DIR)/js-adder.wasm \
 		-o $@
 
-compose: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm
+$(BUILD_DIR)/composed-py.wasm: $(BUILD_DIR)/py-calculator.wasm $(BUILD_DIR)/py-adder.wasm
+	@echo "==> Composing Python calculator + adder"
+	wac plug $(BUILD_DIR)/py-calculator.wasm \
+		--plug $(BUILD_DIR)/py-adder.wasm \
+		-o $@
+
+compose: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm $(BUILD_DIR)/composed-py.wasm
 
 # ─── Hosts ────────────────────────────────────────────────────────────────────
 
 TS_HOST_DIR := hosts/typescript
 
-hosts-transpile: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm
+hosts-transpile: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm $(BUILD_DIR)/composed-py.wasm
 	@echo "==> Transpiling components for TypeScript host"
 	jco transpile $(BUILD_DIR)/composed-go.wasm -o $(TS_HOST_DIR)/transpiled/go --name composed-go --instantiation sync
 	jco transpile $(BUILD_DIR)/composed-js.wasm -o $(TS_HOST_DIR)/transpiled/js --name composed-js --instantiation sync
+	jco transpile $(BUILD_DIR)/composed-py.wasm -o $(TS_HOST_DIR)/transpiled/py --name composed-py --instantiation sync
 
 # ─── Run targets ──────────────────────────────────────────────────────────────
 
-run-python: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm
+run-python: $(BUILD_DIR)/composed-go.wasm $(BUILD_DIR)/composed-js.wasm $(BUILD_DIR)/composed-py.wasm
 	@echo "==> Running Python tests"
 	cd hosts/python && uv run pytest -v
 
@@ -113,13 +140,14 @@ check-types:
 
 # ─── Top-level targets ────────────────────────────────────────────────────────
 
-all: plugins-go plugins-js compose hosts-transpile
+all: plugins-go plugins-js plugins-py compose hosts-transpile
 	@echo "==> Build complete. Run 'make run-all' to test all hosts."
 
 clean:
 	rm -rf $(BUILD_DIR)/*.wasm
-	rm -rf $(TS_HOST_DIR)/transpiled/go $(TS_HOST_DIR)/transpiled/js
-	rm -rf $(JS_ADDER_DIR)/dist $(JS_CALC_DIR)/dist $(JS_CALC_DIR)/types $(JS_ADDER_DIR)/wit.d.ts 
+	rm -rf $(TS_HOST_DIR)/transpiled/go $(TS_HOST_DIR)/transpiled/js $(TS_HOST_DIR)/transpiled/py
+	rm -rf $(JS_ADDER_DIR)/dist $(JS_CALC_DIR)/dist $(JS_CALC_DIR)/types $(JS_ADDER_DIR)/wit.d.ts
+	rm -rf $(PY_CALC_DIR)/wit_world $(PY_CALC_DIR)/wit_calc $(PY_CALC_DIR)/componentize_py_types.py $(PY_CALC_DIR)/componentize_py_async_support $(PY_CALC_DIR)/componentize_py_runtime.pyi $(PY_CALC_DIR)/poll_loop.py
 	rm -f $(GO_ADDER_DIR)/adder-core.wasm $(GO_ADDER_DIR)/adder-embedded.wasm $(GO_ADDER_DIR)/adder.wasm
 	rm -f $(GO_CALC_DIR)/calculator.wasm
 	@echo "==> Cleaned build artifacts"

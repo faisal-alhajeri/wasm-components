@@ -48,3 +48,26 @@ describe("eval-expression-detailed (js)", () => {
     assert.strictEqual(r.y, 7);
   });
 });
+
+describe("eval-expression-detailed (py)", () => {
+  let calculate: Root["calculate"];
+  before(async () => {
+    const { calculate: c } = await getCalculate("py");
+    calculate = c;
+  });
+
+  it("add(3,7)", () => {
+    const r = calculate.evalExpressionDetailed("add", 3, 7);
+    assert.strictEqual(r.value, 10);
+    assert.strictEqual(r.op, "add");
+    assert.strictEqual(r.x, 3);
+    assert.strictEqual(r.y, 7);
+  });
+  it("mul(6,7)", () => {
+    const r = calculate.evalExpressionDetailed("mul", 6, 7);
+    assert.strictEqual(r.value, 42);
+    assert.strictEqual(r.op, "mul");
+    assert.strictEqual(r.x, 6);
+    assert.strictEqual(r.y, 7);
+  });
+});

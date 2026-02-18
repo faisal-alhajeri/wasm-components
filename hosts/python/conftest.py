@@ -23,7 +23,7 @@ class WasmCtx:
     collected_numbers: list[int] = field(default_factory=_empty_int_list)
 
 
-@pytest.fixture(params=["go", "js"])
+@pytest.fixture(params=["go", "js", "py"])
 def wasm_component(request: pytest.FixtureRequest) -> WasmCtx:
     variant = request.param
     wasm_path = os.path.join(_BUILD_DIR, f"composed-{variant}.wasm")

@@ -9,13 +9,13 @@ const cache = new Map<
 >();
 
 export async function getCalculate(
-  variant: "go" | "js"
+  variant: "go" | "js" | "py"
 ): Promise<{ calculate: Root["calculate"]; collectedNumbers: number[] }> {
   const cached = cache.get(variant);
   if (cached) return cached;
 
   const transpiledDir =
-    variant === "go" ? "./transpiled/go" : "./transpiled/js";
+    variant === "go" ? "./transpiled/go" : variant === "js" ? "./transpiled/js" : "./transpiled/py";
   const modPath = `${transpiledDir}/composed-${variant}.js`;
 
   const { instantiate } = (await import(modPath)) as any;
