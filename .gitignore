@@ -8,3 +8,11 @@ plugins/js/*/dist/
 plugins/js/*/types/
 build/
 __pycache__/
+
+
+componentize_py_runtime.pyi
+componentize_py_async_support/
+componentize_py_types.py
+poll_loop.py
+wit_calc/
+wit_world/

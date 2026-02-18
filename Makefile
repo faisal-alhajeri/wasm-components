@@ -10,7 +10,7 @@
 #   - wkg (wasm package tool)
 #   - componentize-py (pip/uv)
 
-.PHONY: all clean plugins-go plugins-js plugins-py compose hosts-transpile \
+.PHONY: all clean plugins-go plugins-js plugins-py types-py compose hosts-transpile \
         run-python run-ts run-all check-types
 
 BUILD_DIR := build
@@ -78,15 +78,22 @@ PY_ADDER_DIR     := plugins/python/adder
 PY_CALC_DIR      := plugins/python/calculator
 HOSTS_PY         := hosts/python
 
+types-py: $(PY_ADDER_DIR)/wit/component.wit $(PY_CALC_DIR)/wit/component.wit
+	@echo "==> Generating Python bindings (componentize-py bindings)"
+	cd $(PY_ADDER_DIR) && wkg wit fetch 
+	rm -rf $(PY_ADDER_DIR)/wit_world
+	cd $(HOSTS_PY) && uv run componentize-py -d ../../$(PY_ADDER_DIR)/wit -w adder bindings ../../$(PY_ADDER_DIR)
+	cd $(PY_CALC_DIR) && wkg wit fetch
+	rm -rf $(PY_CALC_DIR)/wit_calc $(PY_CALC_DIR)/componentize_py_types.py $(PY_CALC_DIR)/componentize_py_async_support $(PY_CALC_DIR)/componentize_py_runtime.pyi $(PY_CALC_DIR)/poll_loop.py
+	cd $(HOSTS_PY) && uv run componentize-py -d ../../$(PY_CALC_DIR)/wit -w calc --world-module wit_calc bindings ../../$(PY_CALC_DIR)
+
 $(BUILD_DIR)/py-adder.wasm: $(PY_ADDER_DIR)/app.py $(PY_ADDER_DIR)/wit/component.wit wit/adder/world.wit $(BUILD_DIR)
 	@echo "==> Building Python adder plugin"
 	cd $(PY_ADDER_DIR) && wkg wit fetch 
 	cd $(HOSTS_PY) && uv run componentize-py -d ../../$(PY_ADDER_DIR)/wit -w adder componentize --stub-wasi -p ../../$(PY_ADDER_DIR) app -o ../../$@
 
-$(BUILD_DIR)/py-calculator.wasm: $(PY_CALC_DIR)/calculate.py $(PY_CALC_DIR)/wit/component.wit wit/calculator/world.wit $(BUILD_DIR)
+$(BUILD_DIR)/py-calculator.wasm: $(PY_CALC_DIR)/calculate.py $(PY_CALC_DIR)/wit/component.wit wit/calculator/world.wit types-py $(BUILD_DIR)
 	@echo "==> Building Python calculator plugin"
-	cd $(PY_CALC_DIR) && wkg wit fetch 
-	cd $(PY_CALC_DIR) && uv run --project ../../$(HOSTS_PY) componentize-py -d wit -w calc --world-module wit_calc bindings . 2>/dev/null || true
 	cd $(HOSTS_PY) && uv run componentize-py -d ../../$(PY_CALC_DIR)/wit -w calc --world-module wit_calc componentize --stub-wasi -p ../../$(PY_CALC_DIR) calculate -o ../../$@
 
 plugins-py: $(BUILD_DIR)/py-adder.wasm $(BUILD_DIR)/py-calculator.wasm
